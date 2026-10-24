@@ -192,9 +192,8 @@ impl Restorer {
     }
 
     pub fn push(&mut self, ev: SseEvent) -> Result<Vec<SseEvent>, RestoreError> {
-        if ev.data.is_empty() {
-            return Ok(vec![ev]);
-        }
+        // Empty data never parses: comment-only blocks and stray blank lines
+        // (no name) go out raw, a handled name without data is refused.
         let parsed = serde_json::from_str::<Value>(&ev.data)
             .ok()
             .filter(Value::is_object);
@@ -847,21 +846,48 @@ mod tests {
     }
     #[test]
     fn empty_data_events_forwarded_raw() {
+        // Comment-only blocks, stray blank lines and unhandled names.
         let mut r = restorer();
         r.push(tool_start(1)).unwrap();
-        let comment = SseEvent {
-            event: None,
-            data: String::new(),
-            raw: b": keep-alive\n\n".to_vec(),
-        };
-        assert_eq!(r.push(comment.clone()).unwrap(), vec![comment]);
-        let named = SseEvent {
-            event: Some("content_block_stop".into()),
-            data: String::new(),
-            raw: b"event: content_block_stop\n\n".to_vec(),
-        };
-        assert_eq!(r.push(named.clone()).unwrap(), vec![named]);
+        for wire in [
+            ": keepalive\n\n",
+            "\n",
+            "event: ping\n\n",
+            "event: surprise\n: x\n\n",
+        ] {
+            let evs = crate::sse::SseParser::default()
+                .push(wire.as_bytes())
+                .unwrap();
+            assert_eq!(
+                (evs.len(), evs[0].data.as_str(), evs[0].raw.as_slice()),
+                (1, "", wire.as_bytes())
+            );
+            assert_eq!(r.push(evs[0].clone()).unwrap(), evs);
+        }
         assert!(r.is_holding());
+    }
+    #[test]
+    fn handled_event_names_need_data() {
+        for name in [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "error",
+        ] {
+            let wire = format!("event: {name}\n\n");
+            let evs = crate::sse::SseParser::default()
+                .push(wire.as_bytes())
+                .unwrap();
+            assert_eq!(evs[0].event.as_deref(), Some(name));
+            let mut r = restorer();
+            r.push(text_start(0)).unwrap();
+            assert!(
+                matches!(r.push(evs[0].clone()), Err(RestoreError::BadEvent(_))),
+                "{name}"
+            );
+        }
     }
     fn named(event: Option<&str>, data: &str) -> SseEvent {
         match event {
