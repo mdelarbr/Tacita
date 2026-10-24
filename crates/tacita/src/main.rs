@@ -35,6 +35,17 @@ enum Cmd {
     },
     /// Run the proxy in the foreground on 127.0.0.1 (Ctrl-C stops it)
     Daemon,
+    /// Claude Code hooks
+    Hook {
+        #[command(subcommand)]
+        event: HookCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Deny tool calls that still hold a Tacita stand-in (reads JSON on stdin)
+    PreToolUse,
 }
 
 #[derive(Subcommand)]
@@ -230,6 +241,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             action: KeyCmd::Set { name },
         } => key_set(&name)?,
         Cmd::Daemon => run_daemon(home).await?,
+        Cmd::Hook { .. } => unreachable!("handled in main"),
     }
     Ok(())
 }
@@ -237,6 +249,13 @@ async fn run(cli: Cli) -> Result<(), String> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    // The hook never goes through `run`: its exit code is the contract.
+    if let Cmd::Hook {
+        event: HookCmd::PreToolUse,
+    } = cli.command
+    {
+        std::process::exit(tacita::hook::run());
+    }
     if let Err(msg) = run(cli).await {
         eprintln!("tacita: {msg}");
         std::process::exit(1);
