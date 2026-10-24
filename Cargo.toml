@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/tacita-core", "crates/tacita"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+aho-corasick = "1.1.5"
+anyhow = "1.0.104"
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = "0.3.34"
+proptest = "1.12.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "http2", "stream"] }
+rpassword = "7.5.4"
+security-framework = "3.7.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "fs", "signal", "sync"] }
+toml = "1.1.8"
