@@ -4,6 +4,7 @@
 use crate::json::{self, Lit, ScanError, Seg};
 use crate::pairs::Pairs;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::ops::Range;
 
 #[derive(Debug)]
@@ -20,6 +21,10 @@ pub enum RequestError {
     Json(#[from] ScanError),
     #[error("request body is not a JSON object")]
     NotAnObject,
+    /// Some object repeats a key. The key is deliberately not named: keys
+    /// inside user data can be business names.
+    #[error("request body has an object with a repeated key")]
+    DuplicateKey,
     /// Scannable but rejected by serde_json (lone surrogate, nesting too deep).
     /// The message is serde's own text and never contains body content.
     #[error("request body is not valid JSON: {0}")]
@@ -27,7 +32,21 @@ pub enum RequestError {
 }
 
 const TOOL_USE_TYPES: [&str; 3] = ["tool_use", "server_tool_use", "mcp_tool_use"];
-const PROTECTED_VALUE_KEYS: [&str; 6] = ["type", "role", "id", "tool_use_id", "signature", "media_type"];
+const PROTECTED_VALUE_KEYS: [&str; 9] = [
+    "type",
+    "role",
+    "id",
+    "tool_use_id",
+    "signature",
+    "media_type",
+    "encrypted_content",
+    "encrypted_index",
+    "file_id",
+];
+
+fn is_key(seg: &Seg, name: &str) -> bool {
+    matches!(seg, Seg::Key(k) if k == name)
+}
 
 fn type_of(v: &Value) -> Option<&str> {
     v.get("type").and_then(Value::as_str)
@@ -54,15 +73,17 @@ fn should_scrub(root: &Value, lit: &Lit) -> bool {
         };
         let parent_type = type_of(cur);
 
-        if matches!(parent_type, Some("thinking" | "redacted_thinking")) {
+        if i >= 1 && matches!(parent_type, Some("thinking" | "redacted_thinking")) {
             return false;
         }
+        let tool_use_parent = i >= 1 && parent_type.is_some_and(|t| TOOL_USE_TYPES.contains(&t));
         // User-data subtrees: everything inside is scrubbed, keys included.
-        let user_data = (key == Some("input") && parent_type.is_some_and(|t| TOOL_USE_TYPES.contains(&t)))
+        let user_data = (key == Some("input") && tool_use_parent)
             || (i == 2
-                && key == Some("input_schema")
-                && matches!(path[0], Seg::Key(ref k) if k == "tools")
-                && matches!(path[1], Seg::Index(_)));
+                && matches!(key, Some("input_schema" | "input_examples"))
+                && is_key(&path[0], "tools")
+                && matches!(path[1], Seg::Index(_)))
+            || (i == 1 && is_key(&path[0], "output_format") && key == Some("schema"));
         if user_data {
             return !is_own_key;
         }
@@ -71,18 +92,21 @@ fn should_scrub(root: &Value, lit: &Lit) -> bool {
         }
         match key {
             Some("cache_control") => return false,
-            Some("data") if i >= 1 && path[i - 1] == Seg::Key("source".into()) => return false,
-            Some("model" | "metadata") if i == 0 => return false,
-            Some("system") if i == 0 && child.is_string() => return false,
-            Some("name") if i == 1 && path[0] == Seg::Key("tool_choice".into()) => return false,
-            Some("name") if i == 2 && matches!(path[1], Seg::Index(_)) && path[0] == Seg::Key("tools".into()) => {
+            // Only base64 payloads (images, PDFs) are opaque; text sources are scrubbed.
+            Some("data") if i >= 1 && is_key(&path[i - 1], "source") && type_of(cur) == Some("base64") => {
                 return false;
             }
-            Some("name") if last && parent_type.is_some_and(|t| TOOL_USE_TYPES.contains(&t)) => return false,
+            Some("model" | "metadata") if i == 0 => return false,
+            Some("system") if i == 0 && child.is_string() => return false,
+            Some("name") if i == 1 && is_key(&path[0], "tool_choice") => return false,
+            Some("name") if i == 2 && matches!(path[1], Seg::Index(_)) && is_key(&path[0], "tools") => {
+                return false;
+            }
+            Some("name") if last && tool_use_parent => return false,
             Some(k) if last && PROTECTED_VALUE_KEYS.contains(&k) => return false,
             _ => {}
         }
-        if i == 1 && matches!(seg, Seg::Index(0 | 1)) && path[0] == Seg::Key("system".into()) {
+        if i == 1 && matches!(seg, Seg::Index(0 | 1)) && is_key(&path[0], "system") {
             return false;
         }
         cur = child;
@@ -96,6 +120,12 @@ fn in_system_tail(lit: &Lit) -> bool {
 
 pub fn scrub_request(body: &[u8], pairs: &Pairs) -> Result<Scrubbed, RequestError> {
     let lits = json::scan(body)?;
+    let mut seen: HashSet<&[Seg]> = HashSet::new();
+    for lit in lits.iter().filter(|l| l.is_key) {
+        if !seen.insert(&lit.path) {
+            return Err(RequestError::DuplicateKey);
+        }
+    }
     let root: Value = serde_json::from_slice(body).map_err(|e| RequestError::Invalid(e.to_string()))?;
     if !root.is_object() {
         return Err(RequestError::NotAnObject);
@@ -180,5 +210,105 @@ mod tests {
         let b = br#"{"system":{"x":"acmewidgets"},"tools":"acmewidgets","messages":[1,"acmewidgets",{"type":5,"name":"acmewidgets"}]}"#;
         let s = scrub_request(b, &test_pairs()).unwrap();
         assert_eq!(s.replacements, 4);
+    }
+    const PROBE: &str = r#"{
+  "model": "acmewidgets",
+  "metadata": {"user_id": "acmewidgets", "x": {"y": "acmewidgets"}},
+  "system": [
+    {"type": "text", "text": "acmewidgets billing"},
+    {"type": "text", "text": "acmewidgets prompt", "cache_control": {"type": "ephemeral", "note": "acmewidgets"}},
+    {"type": "text", "text": "acmewidgets cwd"}
+  ],
+  "tool_choice": {"type": "tool", "name": "acmewidgets"},
+  "tools": [
+    {"name": "acmewidgets", "description": "acmewidgets", "cache_control": {"type": "acmewidgets"},
+     "input_schema": {"acmewidgets": "acmewidgets"},
+     "input_examples": [{"acmewidgets": "acmewidgets"}]}
+  ],
+  "output_format": {"type": "json_schema", "schema": {"acmewidgets": "acmewidgets"}},
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "text", "text": "hi", "cache_control": {"type": "acmewidgets"}},
+      {"type": "image", "source": {"type": "base64", "media_type": "acmewidgets", "data": "acmewidgets"}},
+      {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "acmewidgets"}},
+      {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "acmewidgets"}},
+      {"type": "document", "source": {"type": "file", "file_id": "acmewidgets"}}
+    ]},
+    {"role": "assistant", "content": [
+      {"type": "thinking", "thinking": "acmewidgets", "signature": "acmewidgets"},
+      {"type": "redacted_thinking", "data": "acmewidgets"},
+      {"type": "tool_use", "id": "acmewidgets", "name": "acmewidgets", "input": {"acmewidgets": "acmewidgets"}},
+      {"type": "server_tool_use", "id": "acmewidgets", "name": "acmewidgets", "input": {"query": "acmewidgets"}},
+      {"type": "web_search_tool_result", "tool_use_id": "acmewidgets", "content": [
+        {"type": "web_search_result", "url": "https://acmewidgets.example", "title": "acmewidgets",
+         "encrypted_content": "acmewidgets", "page_age": "1d"}]},
+      {"type": "text", "text": "ok", "citations": [{"type": "web_search_result_location", "cited_text": "acmewidgets",
+         "encrypted_index": "acmewidgets", "url": "u", "title": "t"}]},
+      {"unknown_field": "acmewidgets"}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "acmewidgets", "content": "acmewidgets"}
+    ]}
+  ]
+}"#;
+
+    #[test]
+    fn every_protected_location_is_kept_and_every_user_location_scrubbed() {
+        let s = scrub_request(PROBE.as_bytes(), &test_pairs()).unwrap();
+        let orig: serde_json::Value = serde_json::from_str(PROBE).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&s.body).unwrap();
+        let protected = [
+            "/model", "/metadata", "/system/0", "/system/1", "/tool_choice", "/tools/0/name",
+            "/tools/0/cache_control", "/output_format/type", "/messages/0/content/0/cache_control",
+            "/messages/0/content/1", "/messages/0/content/2", "/messages/0/content/4",
+            "/messages/1/content/0", "/messages/1/content/1",
+            "/messages/1/content/2/id", "/messages/1/content/2/name",
+            "/messages/1/content/3/id", "/messages/1/content/3/name",
+            "/messages/1/content/4/tool_use_id", "/messages/1/content/4/content/0/encrypted_content",
+            "/messages/1/content/5/citations/0/encrypted_index",
+            "/messages/2/content/0/tool_use_id",
+        ];
+        for p in protected {
+            assert_eq!(v.pointer(p), orig.pointer(p), "{p}");
+        }
+        let scrubbed = [
+            "/system/2/text", "/tools/0/description", "/messages/0/content/3/source/data",
+            "/messages/1/content/3/input/query", "/messages/1/content/4/content/0/url",
+            "/messages/1/content/4/content/0/title", "/messages/1/content/5/citations/0/cited_text",
+            "/messages/1/content/6/unknown_field", "/messages/2/content/0/content",
+            "/tools/0/input_schema/client_x01", "/tools/0/input_examples/0/client_x01",
+            "/output_format/schema/client_x01", "/messages/1/content/2/input/client_x01",
+        ];
+        for p in scrubbed {
+            assert!(!v.pointer(p).unwrap().to_string().contains("acmewidgets"), "{p}");
+        }
+        // 13 single hits, plus a key and a value in each of the four user-data subtrees.
+        assert_eq!(s.replacements, 9 + 8);
+        assert_eq!(s.in_system, 1);
+    }
+    #[test]
+    fn string_system_is_kept_whole() {
+        let b = br#"{"system":"acmewidgets","messages":[]}"#;
+        let s = scrub_request(b, &test_pairs()).unwrap();
+        assert_eq!((s.body.as_slice(), s.replacements), (&b[..], 0));
+    }
+    #[test]
+    fn duplicate_keys_are_rejected_without_naming_them() {
+        for b in [
+            r#"{"type":"text","text":"acmewidgets","type":"thinking"}"#,
+            r#"{"messages":[{"role":"user","role":"x"}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_use","input":{"secretco":1,"secretco":2}}]}]}"#,
+        ] {
+            let e = scrub_request(b.as_bytes(), &test_pairs()).unwrap_err();
+            assert!(matches!(e, RequestError::DuplicateKey), "{b}");
+            assert!(!e.to_string().contains("secretco"));
+        }
+        // Same key in different objects is fine.
+        assert!(scrub_request(br#"{"a":{"k":1},"b":{"k":2},"c":[{"k":1},{"k":1}]}"#, &test_pairs()).is_ok());
+    }
+    #[test]
+    fn root_type_does_not_trigger_block_rules() {
+        let b = br#"{"type":"thinking","note":"acmewidgets"}"#;
+        assert_eq!(scrub_request(b, &test_pairs()).unwrap().replacements, 1);
     }
 }

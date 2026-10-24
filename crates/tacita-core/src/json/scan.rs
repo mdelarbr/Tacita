@@ -11,7 +11,7 @@ const MAX_DEPTH: usize = 512;
 /// length of every key in its path.
 const MAX_PATH_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Seg {
     Key(String),
     Index(usize),
