@@ -246,17 +246,27 @@ async fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
-    // The hook never goes through `run`: its exit code is the contract.
+    // The hook runs before any runtime exists: a runtime that fails to build
+    // would panic with exit 101, which lets the tool run.
     if let Cmd::Hook {
         event: HookCmd::PreToolUse,
     } = cli.command
     {
         std::process::exit(tacita::hook::run());
     }
-    if let Err(msg) = run(cli).await {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("tacita: cannot start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(msg) = runtime.block_on(run(cli)) {
         eprintln!("tacita: {msg}");
         std::process::exit(1);
     }

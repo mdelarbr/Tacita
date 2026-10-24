@@ -157,7 +157,20 @@ fn run_with(
     emit(&decision, out, err)
 }
 
+/// Backstop: a panic anywhere in the hook process blocks the call (exit 2),
+/// with a fixed message that holds no panic payload and no input.
+fn install_panic_backstop() {
+    std::panic::set_hook(Box::new(|_| {
+        let Decision::Deny(reason) = cannot_check("internal error") else {
+            unreachable!()
+        };
+        let _ = writeln!(std::io::stderr(), "{reason}");
+        std::process::exit(2);
+    }));
+}
+
 pub fn run() -> i32 {
+    install_panic_backstop();
     run_with(
         std::io::stdin().lock(),
         load_guard,
@@ -291,7 +304,7 @@ mod tests {
         let (mut o, mut e) = (Vec::new(), Vec::new());
         let code = run_with(
             "{}".as_bytes(),
-            || -> Result<Guard, String> { panic!("boom") },
+            || -> Result<Guard, String> { std::panic::resume_unwind(Box::new("boom")) },
             &mut o,
             &mut e,
         );

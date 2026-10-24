@@ -87,3 +87,19 @@ fn denies_when_config_is_invalid() {
     let o = hook(Some(home.path()), r#"{"tool_name":"Bash","tool_input":{}}"#);
     assert_deny(&o, "could not check");
 }
+
+#[test]
+fn other_commands_still_work_without_the_hook_path() {
+    let home = init();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tacita"))
+            .args(args)
+            .env("TACITA_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["init"]).status.success());
+    let st = run(&["status"]);
+    assert!(st.status.success() && String::from_utf8_lossy(&st.stdout).contains("daemon:"));
+    assert!(!run(&["use", "openrouter"]).status.success());
+}
