@@ -83,34 +83,52 @@ struct App {
     next: AtomicU64,
 }
 
-/// Serves until the listener fails. Loads `Config` once; `State` is read on
-/// every request.
+/// Serves until the listener fails: `Server::new` then `Server::run`.
 pub async fn serve(opts: DaemonOptions, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    let addr = listener.local_addr()?;
-    anyhow::ensure!(
-        addr.ip() == Ipv4Addr::LOCALHOST,
-        "Tacita listens on 127.0.0.1 only, not {}",
-        addr.ip()
-    );
-    let config = Config::load(&opts.home)?;
-    let anthropic_host = host_label(&opts.anthropic_upstream)?;
-    let log = MetaLog::open(&opts.home).context("cannot open logs/requests.jsonl")?;
-    let app = Arc::new(App {
-        client: forward::client(&opts.timing),
-        opts,
-        config,
-        port: addr.port(),
-        anthropic_host,
-        log: Arc::new(log),
-        next: AtomicU64::new(1),
-    });
-    let router = Router::new().fallback(handle).with_state(app);
-    let listener = listener.tap_io(|tcp| {
-        // Small SSE writes go out at once.
-        let _ = tcp.set_nodelay(true);
-    });
-    axum::serve(listener, router).await?;
-    Ok(())
+    Server::new(opts, listener)?.run().await
+}
+
+/// A daemon that has checked its listener, loaded `Config` and opened its
+/// request log, so startup errors surface before anything is served.
+pub struct Server {
+    app: Arc<App>,
+    listener: tokio::net::TcpListener,
+}
+
+impl Server {
+    /// Loads `Config` once; it is not reloaded while serving.
+    pub fn new(opts: DaemonOptions, listener: tokio::net::TcpListener) -> anyhow::Result<Server> {
+        let addr = listener.local_addr()?;
+        anyhow::ensure!(
+            addr.ip() == Ipv4Addr::LOCALHOST,
+            "Tacita listens on 127.0.0.1 only, not {}",
+            addr.ip()
+        );
+        let config = Config::load(&opts.home)?;
+        let anthropic_host = host_label(&opts.anthropic_upstream)?;
+        let log = MetaLog::open(&opts.home).context("cannot open logs/requests.jsonl")?;
+        let app = Arc::new(App {
+            client: forward::client(&opts.timing),
+            opts,
+            config,
+            port: addr.port(),
+            anthropic_host,
+            log: Arc::new(log),
+            next: AtomicU64::new(1),
+        });
+        Ok(Server { app, listener })
+    }
+
+    /// Serves until the listener fails. `State` is read on every request.
+    pub async fn run(self) -> anyhow::Result<()> {
+        let router = Router::new().fallback(handle).with_state(self.app);
+        let listener = self.listener.tap_io(|tcp| {
+            // Small SSE writes go out at once.
+            let _ = tcp.set_nodelay(true);
+        });
+        axum::serve(listener, router).await?;
+        Ok(())
+    }
 }
 
 fn host_label(upstream: &str) -> anyhow::Result<String> {

@@ -321,3 +321,19 @@ pub async fn wait_for_lines(path: &Path, n: usize) -> Vec<String> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// Waits for exactly `n` lines in `requests.jsonl` and parses them; panics
+/// with what it found if there are not exactly `n` after 2 s.
+pub async fn meta_lines(t: &Tacita, n: usize) -> Vec<Value> {
+    let lines = wait_for_lines(&t.log_path(), n).await;
+    if lines.len() != n {
+        panic!(
+            "expected {n} line(s) in requests.jsonl within 2 s, found {}: {lines:#?}",
+            lines.len()
+        );
+    }
+    lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad meta line {l}: {e}")))
+        .collect()
+}

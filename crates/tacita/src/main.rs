@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tacita::config::{Config, ConfigError, Protection, Provider, State};
-use tacita::daemon::{DaemonOptions, serve};
+use tacita::daemon::{DaemonOptions, Server};
 use tacita::paths;
 
 #[derive(Parser)]
@@ -125,11 +125,12 @@ async fn run_daemon(home: std::path::PathBuf) -> Result<(), String> {
     // Registered before the banner, so a Ctrl-C right after it is caught.
     let mut interrupt =
         signal(SignalKind::interrupt()).map_err(|e| format!("cannot catch Ctrl-C: {e}"))?;
+    // The banner only once the config is reloaded and the log is open.
+    let server =
+        Server::new(DaemonOptions::production(home), listener).map_err(|e| format!("{e:#}"))?;
     println!("Tacita listening on {}", cfg.base_url());
     tokio::select! {
-        served = serve(DaemonOptions::production(home), listener) => {
-            served.map_err(|e| format!("{e:#}"))
-        }
+        served = server.run() => served.map_err(|e| format!("{e:#}")),
         _ = interrupt.recv() => {
             println!("Tacita stopped");
             Ok(())

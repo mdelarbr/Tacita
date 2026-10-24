@@ -254,42 +254,14 @@ impl Drop for Daemon {
 
 #[test]
 fn daemon_listens_answers_hello_and_stops_on_ctrl_c() {
-    use std::io::{BufRead, Read};
-    use std::time::{Duration, Instant};
+    use std::io::Read;
     let home = tempfile::tempdir().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    init_on_port(home.path(), port);
+    init_on_port(home.path(), free_port());
     let base = out(&run_in(home.path(), &["status", "--base-url"]));
-    let mut d = Daemon(
-        std::process::Command::new(env!("CARGO_BIN_EXE_tacita"))
-            .arg("daemon")
-            .env("TACITA_HOME", home.path())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut stdout = std::io::BufReader::new(d.0.stdout.take().unwrap());
-    let mut line = String::new();
-    stdout.read_line(&mut line).unwrap();
-    assert_eq!(line, format!("Tacita listening on {base}"));
+    let (mut d, mut stdout, banner) = spawn_daemon(home.path(), std::process::Stdio::piped());
+    assert_eq!(banner, format!("Tacita listening on {base}"));
     assert!(out(&run_in(home.path(), &["status"])).contains("daemon:     running"));
-    let killed = std::process::Command::new("kill")
-        .args(["-INT", &d.0.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(killed.success());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(s) = d.0.try_wait().unwrap() {
-            break s;
-        }
-        assert!(Instant::now() < deadline, "daemon did not stop on SIGINT");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = interrupt(&mut d);
     assert!(status.success(), "{status:?}");
     let mut rest = String::new();
     stdout.read_to_string(&mut rest).unwrap();
@@ -307,4 +279,91 @@ fn daemon_listens_answers_hello_and_stops_on_ctrl_c() {
     );
     let log = std::fs::read_to_string(home.path().join("logs/requests.jsonl")).unwrap();
     assert!(log.contains(r#""route":"hello""#), "{log}");
+}
+
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// Spawns `tacita daemon` and returns it with its stdout reader and the
+/// first stdout line.
+fn spawn_daemon(
+    home: &std::path::Path,
+    stderr: std::process::Stdio,
+) -> (
+    Daemon,
+    std::io::BufReader<std::process::ChildStdout>,
+    String,
+) {
+    use std::io::BufRead;
+    let mut d = Daemon(
+        std::process::Command::new(env!("CARGO_BIN_EXE_tacita"))
+            .arg("daemon")
+            .env("TACITA_HOME", home)
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = std::io::BufReader::new(d.0.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    (d, stdout, line)
+}
+
+/// Sends SIGINT and waits up to 5 s for the exit.
+fn interrupt(d: &mut Daemon) -> std::process::ExitStatus {
+    use std::time::{Duration, Instant};
+    let killed = std::process::Command::new("kill")
+        .args(["-INT", &d.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(s) = d.0.try_wait().unwrap() {
+            return s;
+        }
+        assert!(Instant::now() < deadline, "daemon did not stop on SIGINT");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn daemon_survives_a_closed_stderr() {
+    // Rust ignores SIGPIPE, so a write to a closed stderr fails with EPIPE,
+    // which `eprintln!` would turn into a panic inside a request.
+    use std::io::Read;
+    let home = tempfile::tempdir().unwrap();
+    init_on_port(home.path(), free_port());
+    let base = out(&run_in(home.path(), &["status", "--base-url"]));
+    let (mut d, mut stdout, banner) = spawn_daemon(home.path(), std::process::Stdio::piped());
+    drop(d.0.stderr.take());
+    assert_eq!(banner, format!("Tacita listening on {base}"));
+    for _ in 0..2 {
+        assert!(out(&run_in(home.path(), &["status"])).contains("daemon:     running"));
+    }
+    assert!(interrupt(&mut d).success());
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "Tacita stopped\n");
+    let log = std::fs::read_to_string(home.path().join("logs/requests.jsonl")).unwrap();
+    assert_eq!(log.matches(r#""route":"hello""#).count(), 2, "{log}");
+}
+
+#[test]
+fn daemon_prints_no_banner_when_startup_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init_on_port(home.path(), free_port());
+    // `logs` is a file, so the request log cannot be opened.
+    std::fs::write(home.path().join("logs"), b"not a directory").unwrap();
+    let o = run_in(home.path(), &["daemon"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(out(&o), "");
+    assert!(
+        err(&o).starts_with("tacita: cannot open logs/requests.jsonl: "),
+        "{}",
+        err(&o)
+    );
 }

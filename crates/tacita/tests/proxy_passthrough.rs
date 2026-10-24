@@ -28,15 +28,6 @@ async fn start_off(up: &FakeUpstream, or: &FakeUpstream) -> Tacita {
     .await
 }
 
-async fn meta_lines(t: &Tacita, n: usize) -> Vec<Value> {
-    let lines = wait_for_lines(&t.log_path(), n).await;
-    assert_eq!(lines.len(), n, "{lines:?}");
-    lines
-        .iter()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
-}
-
 /// Asserts a Tacita error response and returns its message.
 async fn tacita_error(resp: reqwest::Response, status: u16) -> String {
     assert_eq!(resp.status(), status);
@@ -705,4 +696,36 @@ async fn echo_streams_the_last_user_text_in_small_deltas() {
     let m = &meta_lines(&t, 1).await[0];
     assert_eq!(m["stop_reason"], "end_turn");
     assert_eq!(m["usage"]["output"], 3);
+}
+
+#[tokio::test]
+async fn a_secret_repeated_in_path_or_query_is_never_logged() {
+    let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
+    let or = FakeUpstream::start(vec![]).await;
+    let t = start_off(&up, &or).await;
+    let c = reqwest::Client::new();
+    let r = c
+        .post(format!("{}/{SECRET}/v1/messages", t.base))
+        .body(MIN_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = c
+        .post(format!("{}/v1/messages?k={SECRET}", t.base))
+        .body(MIN_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    r.bytes().await.unwrap();
+    let m = meta_lines(&t, 2).await;
+    assert_eq!(m[0]["path"], "/[secret]/v1/messages");
+    assert_eq!(m[1]["path"], "/v1/messages");
+    assert_eq!(m[1]["query"], "k=[secret]");
+    assert!(
+        !std::fs::read_to_string(t.log_path())
+            .unwrap()
+            .contains(SECRET)
+    );
 }

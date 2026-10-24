@@ -73,8 +73,9 @@ pub struct RequestMeta {
 
 impl RequestMeta {
     /// The fields known from the request line and headers.
-    /// The path and query are recorded only when the secret matched, and
-    /// never with the secret in them.
+    /// The path and query are recorded only when the secret matched. Any
+    /// repeat of the secret in them, in a header name or in the session id
+    /// is written as `[secret]`.
     pub fn begin(
         n: u64,
         method: &Method,
@@ -83,10 +84,16 @@ impl RequestMeta {
         secret: &str,
     ) -> RequestMeta {
         let (path, query) = match strip_secret(uri.path(), secret) {
-            Some(rest) => (rest.to_string(), uri.query().map(str::to_string)),
+            Some(rest) => (
+                mask_secret(rest, secret),
+                uri.query().map(|q| mask_secret(q, secret)),
+            ),
             None => ("(wrong secret)".to_string(), None),
         };
-        let mut header_names: Vec<String> = headers.keys().map(|k| k.to_string()).collect();
+        let mut header_names: Vec<String> = headers
+            .keys()
+            .map(|k| mask_secret(k.as_str(), secret))
+            .collect();
         header_names.sort();
         RequestMeta {
             ts: SystemTime::now()
@@ -96,7 +103,10 @@ impl RequestMeta {
             method: cut(method.as_str(), SHORT_CHARS),
             path,
             query,
-            session: header_text(headers, "x-claude-code-session-id"),
+            session: headers
+                .get("x-claude-code-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| cut(&mask_secret(v, secret), SHORT_CHARS)),
             header_names,
             oauth_bearer: headers
                 .get_all(AUTHORIZATION)
@@ -156,6 +166,13 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|v| cut(v, SHORT_CHARS))
+}
+
+fn mask_secret(s: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return s.to_string();
+    }
+    s.replace(secret, "[secret]")
 }
 
 /// The first `max` characters.
@@ -310,19 +327,23 @@ impl MetaLog {
     }
 
     /// Writes the line, then a one-line summary on stderr. A write failure
-    /// is reported on stderr; it never panics.
+    /// is reported on stderr. It never panics: it runs in drop guards, and
+    /// `eprintln!` panics when stderr is closed (Rust ignores SIGPIPE).
     pub fn append(&self, meta: &RequestMeta) {
+        let mut stderr = std::io::stderr().lock();
         match serde_json::to_string(meta) {
             Ok(json) => {
                 let line = redact(&json) + "\n";
                 let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Err(e) = file.write_all(line.as_bytes()) {
-                    eprintln!("Tacita: cannot write logs/requests.jsonl: {e}");
+                    let _ = writeln!(stderr, "Tacita: cannot write logs/requests.jsonl: {e}");
                 }
             }
-            Err(e) => eprintln!("Tacita: cannot encode a log line: {e}"),
+            Err(e) => {
+                let _ = writeln!(stderr, "Tacita: cannot encode a log line: {e}");
+            }
         }
-        eprintln!("{}", summary(meta));
+        let _ = writeln!(stderr, "{}", summary(meta));
     }
 }
 
@@ -405,6 +426,27 @@ mod tests {
         let m = RequestMeta::begin(5, &Method::GET, &uri, &h, S);
         assert_eq!(m.path, "(wrong secret)");
         assert_eq!(m.query, None);
+    }
+
+    #[test]
+    fn a_repeated_secret_is_masked_everywhere_begin_records() {
+        let name = format!("x-{S}");
+        let h = headers(&[
+            ("host", "127.0.0.1:1"),
+            (name.as_str(), "1"),
+            ("x-claude-code-session-id", S),
+        ]);
+        let uri: Uri = format!("/{S}/{S}/v1/messages?k={S}&j=a{S}b")
+            .parse()
+            .unwrap();
+        let m = RequestMeta::begin(1, &Method::POST, &uri, &h, S);
+        assert_eq!(m.path, "/[secret]/v1/messages");
+        assert_eq!(m.query.as_deref(), Some("k=[secret]&j=a[secret]b"));
+        assert_eq!(
+            m.header_names,
+            ["host", "x-[secret]", "x-claude-code-session-id"]
+        );
+        assert_eq!(m.session.as_deref(), Some("[secret]"));
     }
 
     #[test]
