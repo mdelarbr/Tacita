@@ -311,4 +311,34 @@ mod tests {
         let b = br#"{"type":"thinking","note":"acmewidgets"}"#;
         assert_eq!(scrub_request(b, &test_pairs()).unwrap().replacements, 1);
     }
+    fn scrub_str(b: &str) -> (String, usize) {
+        let s = scrub_request(b.as_bytes(), &test_pairs()).unwrap();
+        (String::from_utf8(s.body).unwrap(), s.replacements)
+    }
+    #[test]
+    fn type_values_outside_user_data_are_kept() {
+        let b = r#"{"messages":[{"role":"user","content":[{"type":"acmewidgets"}]}]}"#;
+        assert_eq!(scrub_str(b), (b.to_string(), 0));
+    }
+    #[test]
+    fn role_values_are_kept() {
+        let b = r#"{"messages":[{"role":"acmewidgets","content":"hi"}]}"#;
+        assert_eq!(scrub_str(b), (b.to_string(), 0));
+    }
+    #[test]
+    fn signature_on_a_non_thinking_block_is_kept() {
+        let b = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi","signature":"acmewidgets"}]}]}"#;
+        assert_eq!(scrub_str(b), (b.to_string(), 0));
+    }
+    #[test]
+    fn keys_outside_user_data_are_never_rewritten() {
+        let b = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi","acmewidgets":"v"}]}]}"#;
+        assert_eq!(scrub_str(b), (b.to_string(), 0));
+    }
+    #[test]
+    fn root_object_is_not_a_tool_use_block() {
+        let b = r#"{"type":"tool_use","input":{"acmewidgets":"acmewidgets"},"messages":[]}"#;
+        let want = r#"{"type":"tool_use","input":{"acmewidgets":"client_x01"},"messages":[]}"#;
+        assert_eq!(scrub_str(b), (want.to_string(), 1));
+    }
 }
