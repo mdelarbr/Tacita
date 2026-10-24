@@ -4,6 +4,7 @@
 //! could still become a stand-in. A `tool_use` block is held until it stops,
 //! then emitted once with its input restored. Thinking is never restored.
 
+use crate::errors::error_event;
 use crate::json::{Lit, ScanError, Seg, decode, encode, replace, scan, scan_tolerant, splice};
 use crate::pairs::Pairs;
 use crate::sse::SseEvent;
@@ -31,7 +32,7 @@ pub enum RestoreError {
     BadEvent(String),
     #[error("a tool call was larger than the limit and was not passed on")]
     ToolTooLarge,
-    #[error("the stream probe text was found in the reply")]
+    #[error("stream probe: this reply was stopped on purpose (Step 0)")]
     Probe,
 }
 
@@ -78,11 +79,8 @@ fn with_delta_field(ev: &SseEvent, field: &str, text: &str) -> Result<SseEvent, 
     };
     let data = splice(data, vec![(lit.span.clone(), encode(text).into_bytes())]);
     let data = String::from_utf8(data).map_err(|_| bad("restored event is not UTF-8"))?;
-    // No `event:` line means the default type, which is "message".
-    Ok(SseEvent::build(
-        ev.event.as_deref().unwrap_or("message"),
-        &data,
-    ))
+    // Only deltas are rebuilt, and dispatch checked that their name is exactly this.
+    Ok(SseEvent::build("content_block_delta", &data))
 }
 
 #[derive(Default)]
@@ -144,14 +142,29 @@ struct HeldTool {
     input: String,
 }
 
+/// The events Tacita handles. Every other event is forwarded untouched.
+#[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Start,
     Delta,
     Stop,
-    /// `message_delta`, `message_stop` or `error`.
-    End {
-        message: bool,
-    },
+    MessageDelta,
+    MessageStop,
+    Error,
+}
+
+impl Kind {
+    fn from_name(name: &str) -> Option<Kind> {
+        Some(match name {
+            "content_block_start" => Kind::Start,
+            "content_block_delta" => Kind::Delta,
+            "content_block_stop" => Kind::Stop,
+            "message_delta" => Kind::MessageDelta,
+            "message_stop" => Kind::MessageStop,
+            "error" => Kind::Error,
+            _ => return None,
+        })
+    }
 }
 
 pub struct Restorer {
@@ -185,25 +198,24 @@ impl Restorer {
         let parsed = serde_json::from_str::<Value>(&ev.data)
             .ok()
             .filter(Value::is_object);
-        let kind = match parsed.as_ref().and_then(type_of).or(ev.event.as_deref()) {
-            Some("content_block_start") => Kind::Start,
-            Some("content_block_delta") => Kind::Delta,
-            Some("content_block_stop") => Kind::Stop,
-            Some("message_delta" | "message_stop") => Kind::End { message: true },
-            Some("error") => Kind::End { message: false },
-            _ => return Ok(vec![ev]),
-        };
-        let Some(v) = parsed else {
-            return Err(bad("event data is not a JSON object"));
+        let by_type = parsed.as_ref().and_then(type_of).and_then(Kind::from_name);
+        let by_name = ev.event.as_deref().and_then(Kind::from_name);
+        // Claude Code picks events by name and parses the data of handled
+        // names only, so for those the name and the data's type must agree.
+        let (kind, v) = match (by_name, by_type, parsed) {
+            (None, None, _) => return Ok(vec![ev]),
+            (Some(n), Some(t), Some(v)) if n == t => (n, v),
+            (Some(_), _, _) => return Err(bad("an event's data does not match its name")),
+            (None, Some(_), _) => return Err(bad("an event's name does not match its data")),
         };
         match kind {
             Kind::Start => self.start(ev, &v),
             Kind::Delta => self.delta(ev, &v),
             Kind::Stop => self.stop(ev, &v),
-            Kind::End { message: true } if self.held.is_some() => {
+            Kind::MessageDelta | Kind::MessageStop if self.held.is_some() => {
                 Err(bad("the message ended while a tool call was still open"))
             }
-            Kind::End { .. } => {
+            Kind::MessageDelta | Kind::MessageStop | Kind::Error => {
                 let mut out = self.flush_all()?;
                 out.push(ev);
                 Ok(out)
@@ -212,10 +224,12 @@ impl Restorer {
     }
 
     /// Flushes text carries. A tool block still held is dropped. A failure
-    /// while flushing drops the flushed text: the stream is over anyway.
+    /// while flushing (the probe) replaces the flushed text with an error event.
     pub fn finish(&mut self) -> Vec<SseEvent> {
         self.held = None;
-        let out = self.flush_all().unwrap_or_default();
+        let out = self
+            .flush_all()
+            .unwrap_or_else(|e| vec![error_event(&e.to_string())]);
         self.texts.clear();
         out
     }
@@ -238,16 +252,18 @@ impl Restorer {
         if self.held.is_some() {
             return Err(bad("a block started while a tool call was still open"));
         }
+        let index = index_of(v);
+        if index.is_some_and(|i| self.texts.contains_key(&i)) {
+            return Err(bad("a block started at the index of an open text block"));
+        }
         match v.get("content_block").and_then(type_of) {
             Some("text") => {
-                let index = index_of(v).ok_or_else(|| bad("text block without an index"))?;
-                if self.texts.insert(index, TextBlock::default()).is_some() {
-                    return Err(bad("text block started twice"));
-                }
+                let index = index.ok_or_else(|| bad("text block without an index"))?;
+                self.texts.insert(index, TextBlock::default());
                 Ok(vec![ev])
             }
             Some("tool_use") => {
-                let index = index_of(v).ok_or_else(|| bad("tool call without an index"))?;
+                let index = index.ok_or_else(|| bad("tool call without an index"))?;
                 self.held = Some(HeldTool {
                     index,
                     start: ev,
@@ -293,6 +309,9 @@ impl Restorer {
         self.restored += n;
         let emitted = if out.is_empty() {
             Vec::new()
+        } else if out == text {
+            // Nothing changed: the upstream bytes go out untouched.
+            vec![ev.clone()]
         } else {
             vec![with_delta_field(&ev, "text", &out)?]
         };
@@ -314,8 +333,14 @@ impl Restorer {
             out.push(ev);
             return Ok(out);
         }
+        let Some(index) = index else {
+            if !self.texts.is_empty() {
+                return Err(bad("a block stopped without an index while text was open"));
+            }
+            return Ok(vec![ev]);
+        };
         let mut out = Vec::new();
-        if let Some(mut block) = index.and_then(|i| self.texts.remove(&i))
+        if let Some(mut block) = self.texts.remove(&index)
             && let Some((flushed, n)) = block.flush(&self.pairs, self.probe.as_deref())?
         {
             self.restored += n;
@@ -540,7 +565,11 @@ mod tests {
         fn any_split_equals_full_restore(
             toks in prop::collection::vec(
                 prop::sample::select(
-                    ["client_x01", "ClientX01", "person_x01", "clie", "x0", "1", " ", "é", "😀", "a"].to_vec(),
+                    [
+                        "client_x01", "ClientX01", "person_x01", "client_x0", "ClientX", "clie", "x0", "1", " ",
+                        "é", "😀", "a",
+                    ]
+                    .to_vec(),
                 ),
                 0..=30,
             ),
@@ -560,6 +589,8 @@ mod tests {
             parts.push(&full[prev..]);
             let out = run(&mut restorer(), text_stream(&parts));
             prop_assert_eq!(text_of(&out), test_pairs().restore_str(&full).0);
+            let texts: Vec<Value> = out.iter().map(data).filter(|d| d["delta"]["type"] == "text_delta").collect();
+            prop_assert!(texts.iter().all(|d| d["delta"]["text"] != ""), "empty text_delta in {:?}", texts);
         }
     }
 
@@ -832,17 +863,110 @@ mod tests {
         assert_eq!(r.push(named.clone()).unwrap(), vec![named]);
         assert!(r.is_holding());
     }
+    fn named(event: Option<&str>, data: &str) -> SseEvent {
+        match event {
+            Some(name) => SseEvent::build(name, data),
+            None => SseEvent {
+                event: None,
+                data: data.into(),
+                raw: format!("data: {data}\n\n").into_bytes(),
+            },
+        }
+    }
     #[test]
-    fn dispatch_uses_the_data_type_first() {
-        // Named like a ping, but the data is a text delta: it is restored.
+    fn handled_type_under_another_name_fails_closed() {
+        // Claude Code would skip or ignore these, losing the carry with them.
+        let delta = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"1 b"}}).to_string();
+        for name in [
+            Some("ping"),
+            None,
+            Some("message"),
+            Some("content_block_stop"),
+        ] {
+            let mut r = restorer();
+            r.push(text_start(0)).unwrap();
+            r.push(text_delta(0, "a client_x0")).unwrap();
+            assert!(
+                matches!(r.push(named(name, &delta)), Err(RestoreError::BadEvent(_))),
+                "{name:?}"
+            );
+        }
+    }
+    #[test]
+    fn handled_name_with_another_data_type_fails_closed() {
+        for data in [
+            json!({"type":"ping"}),
+            json!({"index":0}),
+            json!({"type":"message_stop"}),
+        ] {
+            let res = restorer().push(ev("message_delta", data));
+            assert!(matches!(res, Err(RestoreError::BadEvent(_))));
+        }
+    }
+    #[test]
+    fn other_events_are_forwarded_untouched() {
         let mut r = restorer();
         r.push(text_start(0)).unwrap();
-        let e = ev(
-            "ping",
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"client_x01"}}),
+        r.push(text_delta(0, "a client_x0")).unwrap();
+        let start = json!({"type":"message_start","message":{"content":[{"type":"text","text":"client_x01"}]}});
+        for e in [
+            named(Some("ping"), r#"{"type": "ping"}"#),
+            named(None, r#"{"type":"ping"}"#),
+            named(Some("message"), "client_x01"),
+            named(None, r#"{"type":"surprise","text":"client_x01"}"#),
+            named(Some("message_start"), &start.to_string()),
+        ] {
+            assert_eq!(r.push(e.clone()).unwrap(), vec![e]);
+        }
+    }
+    #[test]
+    fn block_start_at_an_open_text_index_fails_closed() {
+        let thinking = ev(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
         );
-        let out = r.push(e).unwrap();
-        assert_eq!(text_of(&out), "acmewidgets");
-        assert_eq!(out[0].event.as_deref(), Some("ping"));
+        for e in [text_start(0), tool_start(0), thinking] {
+            let mut r = restorer();
+            r.push(text_start(0)).unwrap();
+            assert!(matches!(r.push(e), Err(RestoreError::BadEvent(_))));
+        }
+    }
+    #[test]
+    fn block_stop_without_index_fails_closed_while_text_is_open() {
+        for d in [
+            json!({"type":"content_block_stop"}),
+            json!({"type":"content_block_stop","index":"0"}),
+            json!({"type":"content_block_stop","index":-1}),
+        ] {
+            let mut r = restorer();
+            r.push(text_start(0)).unwrap();
+            assert!(matches!(
+                r.push(ev("content_block_stop", d.clone())),
+                Err(RestoreError::BadEvent(_))
+            ));
+            let alone = ev("content_block_stop", d);
+            assert_eq!(restorer().push(alone.clone()).unwrap(), vec![alone]);
+        }
+    }
+    #[test]
+    fn probe_hit_in_finish_becomes_an_error_event() {
+        let mut r = Restorer::new(pairs(), Limits::default(), Some("zz client".into()));
+        let mut out = r.push(text_start(0)).unwrap();
+        out.extend(r.push(text_delta(0, "zz client_x0")).unwrap());
+        assert_eq!(text_of(&out), "zz ");
+        let probe =
+            crate::errors::error_event("stream probe: this reply was stopped on purpose (Step 0)");
+        assert_eq!(r.finish(), vec![probe]);
+    }
+    #[test]
+    fn unchanged_text_delta_is_forwarded_byte_identical() {
+        let wire = "event: content_block_delta\r\ndata:{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\\/b\"}}\r\n\r\n";
+        let evs = crate::sse::SseParser::default()
+            .push(wire.as_bytes())
+            .unwrap();
+        assert_eq!((evs.len(), evs[0].raw.as_slice()), (1, wire.as_bytes()));
+        let mut r = restorer();
+        r.push(text_start(0)).unwrap();
+        assert_eq!(r.push(evs[0].clone()).unwrap(), evs);
     }
 }
