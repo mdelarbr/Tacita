@@ -2,6 +2,7 @@
 
 pub mod forward;
 pub mod metalog;
+mod reply;
 pub mod route;
 mod stream;
 
@@ -15,7 +16,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::serve::ListenerExt;
@@ -23,7 +24,6 @@ use futures_util::StreamExt;
 use tacita_core::errors::error_body;
 use tacita_core::pairs::Pairs;
 use tacita_core::request::scrub_request;
-use tacita_core::restore::{Limits, Restorer, restore_message};
 
 use crate::config::{self, Config, Protection, Provider};
 use crate::secrets::SecretStore;
@@ -36,8 +36,6 @@ const OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api";
 
 /// Largest request body read.
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
-/// Largest non-streamed reply read for restoring.
-const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 /// Longest reason put into a Tacita error or `tacita_error`.
 const MAX_REASON_BYTES: usize = 200;
 
@@ -303,7 +301,7 @@ async fn messages(
         .send()
         .await;
     match sent {
-        Ok(upstream) if protected => protected_reply(app, upstream, m).await,
+        Ok(upstream) if protected => reply::protected_reply(app, upstream, m).await,
         Ok(upstream) => pass_through(upstream, m),
         Err(e) => {
             let message = format!("cannot reach {}: {}", app.anthropic_host, short_reason(&e));
@@ -372,100 +370,6 @@ fn bounded(reason: &str) -> &str {
 /// An empty needle matches nothing.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-enum Media {
-    EventStream,
-    Json,
-}
-
-/// The one `content-type`, by type/subtype before any parameter.
-fn media_type(headers: &HeaderMap) -> Option<Media> {
-    let mut values = headers.get_all(CONTENT_TYPE).iter();
-    let (Some(value), None) = (values.next(), values.next()) else {
-        return None;
-    };
-    let essence = value.to_str().ok()?.split(';').next()?.trim();
-    if essence.eq_ignore_ascii_case("text/event-stream") {
-        Some(Media::EventStream)
-    } else if essence.eq_ignore_ascii_case("application/json") {
-        Some(Media::Json)
-    } else {
-        None
-    }
-}
-
-fn is_identity(headers: &HeaderMap) -> bool {
-    headers.get_all(CONTENT_ENCODING).iter().all(|v| {
-        v.to_str()
-            .is_ok_and(|e| e.trim().eq_ignore_ascii_case("identity"))
-    })
-}
-
-/// The reply in a protected mode. A 2xx is restored or refused with a 502,
-/// never passed on as it came; any other status is passed on verbatim.
-async fn protected_reply(app: &App, upstream: reqwest::Response, mut m: MetaHandle) -> Response {
-    let status = upstream.status();
-    if !status.is_success() {
-        return pass_through(upstream, m);
-    }
-    let headers = upstream.headers().clone();
-    m.meta.upstream_response(status, &headers);
-    let identity = is_identity(&headers);
-    let body = match media_type(&headers) {
-        Some(Media::EventStream) if !identity => {
-            return m.fail(
-                StatusCode::BAD_GATEWAY,
-                "compressed stream from upstream; refusing to pass it on unrestored",
-            );
-        }
-        Some(Media::EventStream) => {
-            let restorer = Restorer::new(
-                app.pairs.clone(),
-                Limits::default(),
-                app.config.step0.stream_probe.clone(),
-            );
-            stream::restoring_body(upstream.bytes_stream(), restorer, app.opts.timing, m)
-        }
-        Some(Media::Json) if !identity => return unrestorable(m, "it is compressed"),
-        Some(Media::Json) => {
-            let raw = match read_reply(upstream).await {
-                Ok(raw) => raw,
-                Err(reason) => return unrestorable(m, &reason),
-            };
-            match restore_message(&raw, &app.pairs) {
-                Ok((restored, n)) => {
-                    m.meta.restored = Some(n);
-                    Body::from(restored)
-                }
-                Err(e) => return unrestorable(m, &e.to_string()),
-            }
-        }
-        None => return unrestorable(m, "it is neither an event stream nor JSON"),
-    };
-    let mut resp = Response::new(body);
-    *resp.status_mut() = status;
-    *resp.headers_mut() = forward::response_headers(&headers, true);
-    resp
-}
-
-fn unrestorable(m: MetaHandle, reason: &str) -> Response {
-    let message = format!("could not restore the reply: {}", bounded(reason));
-    m.fail(StatusCode::BAD_GATEWAY, &message)
-}
-
-/// Reads a whole non-streamed reply, up to `MAX_REPLY_BYTES`.
-async fn read_reply(upstream: reqwest::Response) -> Result<Vec<u8>, String> {
-    let mut stream = upstream.bytes_stream();
-    let mut out = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("it broke off: {}", short_reason(&e)))?;
-        if out.len() + chunk.len() > MAX_REPLY_BYTES {
-            return Err("it is larger than 64 MiB".to_string());
-        }
-        out.extend_from_slice(&chunk);
-    }
-    Ok(out)
 }
 
 /// Status, headers and body bytes go to the client unchanged and unbuffered;

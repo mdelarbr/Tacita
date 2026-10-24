@@ -65,16 +65,15 @@ async fn text_body(resp: reqwest::Response) -> String {
     String::from_utf8(resp.bytes().await.unwrap().to_vec()).unwrap()
 }
 
-/// Asserts a Tacita error response and returns its message.
-async fn tacita_error(resp: reqwest::Response, status: u16) -> String {
-    assert_eq!(resp.status(), status);
-    assert_eq!(resp.headers()["content-type"], "application/json");
-    let v: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
-    assert_eq!(v["type"], "error");
-    assert_eq!(v["error"]["type"], "invalid_request_error");
-    let msg = v["error"]["message"].as_str().unwrap().to_string();
-    assert!(msg.starts_with("Tacita: "), "{msg}");
-    msg
+/// Asserts a Tacita 502 and whether Claude Code may retry it (no
+/// `x-should-retry: false`); returns the message.
+async fn bad_gateway(resp: reqwest::Response, retry: bool) -> String {
+    let flag = resp
+        .headers()
+        .get("x-should-retry")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(flag.as_deref(), if retry { None } else { Some("false") });
+    tacita_error(resp, 502).await
 }
 
 /// `(name, data)` of every event of an SSE body.
@@ -128,10 +127,6 @@ fn message_end() -> Vec<(&'static str, Value)> {
         ),
         ("message_stop", json!({"type":"message_stop"})),
     ]
-}
-
-fn stop_only() -> Vec<u8> {
-    sse(&[("message_stop", json!({"type":"message_stop"}))])
 }
 
 fn tool_start(index: u64) -> (&'static str, Value) {
@@ -459,7 +454,7 @@ async fn unreadable_json_reply_fails_closed() {
     )])
     .await;
     let t = start_pairs(&up, Timing::default()).await;
-    let msg = tacita_error(post(&t, body_with_text("hi")).await, 502).await;
+    let msg = bad_gateway(post(&t, body_with_text("hi")).await, false).await;
     assert!(
         msg.starts_with("Tacita: could not restore the reply: "),
         "{msg}"
@@ -485,7 +480,7 @@ async fn compressed_stream_fails_closed() {
     )])
     .await;
     let t = start_pairs(&up, Timing::default()).await;
-    let msg = tacita_error(post(&t, body_with_text("hi")).await, 502).await;
+    let msg = bad_gateway(post(&t, body_with_text("hi")).await, false).await;
     assert_eq!(
         msg,
         "Tacita: compressed stream from upstream; refusing to pass it on unrestored"
@@ -518,7 +513,7 @@ async fn compressed_json_fails_closed_and_identity_is_accepted() {
     ])
     .await;
     let t = start_pairs(&up, Timing::default()).await;
-    let msg = tacita_error(post(&t, body_with_text("hi")).await, 502).await;
+    let msg = bad_gateway(post(&t, body_with_text("hi")).await, false).await;
     assert!(
         msg.starts_with("Tacita: could not restore the reply: "),
         "{msg}"
@@ -572,18 +567,26 @@ async fn replies_neither_sse_nor_json_fail_closed() {
     let up = FakeUpstream::start(vec![
         Reply::status(200, &[], "see client_x01"),
         Reply::status(200, &[("content-type", "text/plain")], "see client_x01"),
+        Reply::status(
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("content-type", "application/json"),
+            ],
+            r#"{"content":[{"type":"text","text":"see client_x01"}]}"#,
+        ),
     ])
     .await;
     let t = start_pairs(&up, Timing::default()).await;
-    for _ in 0..2 {
-        let msg = tacita_error(post(&t, body_with_text("hi")).await, 502).await;
+    for _ in 0..3 {
+        let msg = bad_gateway(post(&t, body_with_text("hi")).await, false).await;
         assert!(
             msg.starts_with("Tacita: could not restore the reply: "),
             "{msg}"
         );
         assert!(!msg.contains("client_x01"), "{msg}");
     }
-    let m = meta_lines(&t, 2).await;
+    let m = meta_lines(&t, 3).await;
     assert!(m.iter().all(|l| l["tacita_error"].is_string()));
 }
 
@@ -732,18 +735,31 @@ async fn unparseable_stream_ends_with_error() {
 
 #[tokio::test]
 async fn concurrent_sessions_restore_independently() {
-    let up = FakeUpstream::start(vec![Reply::Echo]).await;
+    // Each event is its own chunk 20 ms apart: the 8 replies overlap.
+    let up = FakeUpstream::start(vec![Reply::EchoSlow { delay_ms: 20 }]).await;
     let t = start_pairs(&up, Timing::default()).await;
     let runs = (0..8).map(|i| {
         let t = &t;
         async move {
-            let text = text_body(post(t, body_with_text(&format!("n{i} acmewidgets"))).await).await;
-            (i, text_of(&events(&text)))
+            let mut resp = post(t, body_with_text(&format!("n{i} acmewidgets"))).await;
+            let mut bytes = Vec::new();
+            let mut first = None;
+            while let Some(chunk) = resp.chunk().await.unwrap() {
+                first.get_or_insert_with(Instant::now);
+                bytes.extend_from_slice(&chunk);
+            }
+            let text = String::from_utf8(bytes).unwrap();
+            (i, text_of(&events(&text)), first.unwrap(), Instant::now())
         }
     });
-    for (i, got) in futures_util::future::join_all(runs).await {
-        assert_eq!(got, format!("n{i} acmewidgets"));
+    let results = futures_util::future::join_all(runs).await;
+    for (i, got, _, _) in &results {
+        assert_eq!(*got, format!("n{i} acmewidgets"));
     }
+    // Every reply had started before any reply ended.
+    let last_first = results.iter().map(|r| r.2).max().unwrap();
+    let first_end = results.iter().map(|r| r.3).min().unwrap();
+    assert!(last_first < first_end);
     assert_eq!(up.count(), 8);
     let lines = meta_lines(&t, 8).await;
     assert!(lines.iter().all(|m| m["restored"] == 1), "{lines:?}");
@@ -835,4 +851,89 @@ async fn meta_line_written_once_when_the_client_leaves_mid_hold() {
     assert_eq!(m[0]["dangling"], 0);
     tokio::time::sleep(ms(300)).await;
     assert_eq!(wait_for_lines(&t.log_path(), 2).await.len(), 1);
+}
+
+#[tokio::test]
+async fn json_reply_broken_midway_is_a_retryable_502() {
+    // The declared length is never reached: the upstream drops mid-body.
+    let up = FakeUpstream::start(vec![Reply::chunks(
+        200,
+        &[
+            ("content-type", "application/json"),
+            ("content-length", "100000"),
+        ],
+        vec![(
+            0,
+            br#"{"content":[{"type":"text","text":"see client_x01"#.to_vec(),
+        )],
+    )])
+    .await;
+    let t = start_pairs(&up, Timing::default()).await;
+    let msg = bad_gateway(post(&t, body_with_text("hi")).await, true).await;
+    assert!(
+        msg.starts_with("Tacita: could not restore the reply: it broke off: "),
+        "{msg}"
+    );
+    assert!(!msg.contains("client_x01"), "{msg}");
+    assert_eq!(meta_lines(&t, 1).await[0]["status"], 502);
+}
+
+#[tokio::test]
+async fn upstream_error_event_ends_the_stream() {
+    let overloaded =
+        json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}});
+    let up = FakeUpstream::start(vec![sse_reply(vec![
+        (0, vec![message_start(), tool_start(1), tool_delta(1, "{")]),
+        (200, vec![("error", overloaded)]),
+        // The upstream stays open long after its error.
+        (3000, vec![("ping", json!({"type":"ping"}))]),
+    ])])
+    .await;
+    let t = start_pairs(&up, timing(50, 2000)).await;
+    let sent = Instant::now();
+    let text = text_body(post(&t, body_with_text("read it")).await).await;
+    assert!(sent.elapsed() < ms(1500), "{:?}", sent.elapsed());
+    let evs = events(&text);
+    assert_eq!(errors(&evs), ["Overloaded"]);
+    assert_eq!(evs.last().unwrap().0, "error");
+    let after = &text[text.find("event: error").unwrap()..];
+    assert!(!after.contains("event: ping"), "{after}");
+    assert!(text.matches(PING).count() >= 1, "{text}");
+    assert_eq!(tool_starts(&evs), 0);
+    let m = &meta_lines(&t, 1).await[0];
+    assert_eq!(m["upstream_error"], "overloaded_error: Overloaded");
+    assert_eq!(m["tacita_error"], Value::Null);
+}
+
+#[tokio::test]
+async fn upstream_reset_is_logged_with_its_cause() {
+    let up = FakeUpstream::start(vec![Reply::chunks(
+        200,
+        &[
+            ("content-type", "text/event-stream"),
+            ("content-length", "100000"),
+        ],
+        // The events are flushed; the upstream then drops before the
+        // declared length is reached.
+        vec![
+            (
+                0,
+                sse(&[message_start(), text_start(0), text_delta(0, "hi")]),
+            ),
+            (100, b": more\n\n".to_vec()),
+        ],
+    )])
+    .await;
+    let t = start_pairs(&up, Timing::default()).await;
+    let evs = events(&text_body(post(&t, body_with_text("hi")).await).await);
+    let cut = "the reply from upstream was cut off; any tool call in progress was not passed on";
+    assert_eq!(text_of(&evs), "hi");
+    assert_eq!(errors(&evs), [format!("Tacita: {cut}")]);
+    let m = &meta_lines(&t, 1).await[0];
+    let logged = m["tacita_error"].as_str().unwrap();
+    assert!(logged.starts_with(&format!("{cut}: ")), "{logged}");
+    assert!(
+        logged.len() > cut.len() + 2 && logged.len() <= 200,
+        "{logged}"
+    );
 }

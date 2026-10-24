@@ -8,10 +8,6 @@ use tacita::daemon::Timing;
 
 const MIN_BODY: &str = r#"{"model":"claude-opus-5-5","max_tokens":10,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=1"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
 
-fn stop_only() -> Vec<u8> {
-    sse(&[("message_stop", json!({"type":"message_stop"}))])
-}
-
 fn message_start(cache_read: u64) -> Value {
     json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":2,"cache_read_input_tokens":cache_read,"output_tokens":1}}})
 }
@@ -26,18 +22,6 @@ async fn start_off(up: &FakeUpstream, or: &FakeUpstream) -> Tacita {
         Timing::default(),
     )
     .await
-}
-
-/// Asserts a Tacita error response and returns its message.
-async fn tacita_error(resp: reqwest::Response, status: u16) -> String {
-    assert_eq!(resp.status(), status);
-    assert_eq!(resp.headers()["content-type"], "application/json");
-    let v: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
-    assert_eq!(v["type"], "error");
-    assert_eq!(v["error"]["type"], "invalid_request_error");
-    let msg = v["error"]["message"].as_str().unwrap().to_string();
-    assert!(msg.starts_with("Tacita: "), "{msg}");
-    msg
 }
 
 #[tokio::test]
@@ -421,6 +405,8 @@ async fn upstream_unreachable_is_a_visible_error() {
         .send()
         .await
         .unwrap();
+    // Transient: Claude Code may retry it.
+    assert!(resp.headers().get("x-should-retry").is_none());
     let msg = tacita_error(resp, 502).await;
     assert!(
         msg.starts_with("Tacita: cannot reach 127.0.0.1:1: "),

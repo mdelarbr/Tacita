@@ -79,6 +79,8 @@ pub enum Reply {
     /// An SSE text reply that streams back `messages[-1].content[0].text`
     /// in 3-character deltas.
     Echo,
+    /// `Echo`, but each event is its own chunk, sent after `delay_ms`.
+    EchoSlow { delay_ms: u64 },
 }
 
 fn owned(headers: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -181,19 +183,33 @@ async fn fake_reply(State(fake): State<Arc<Fake>>, req: Request) -> Response {
             status,
             headers,
             chunks,
-        }) => {
-            let stream = futures_util::stream::iter(chunks).then(|(delay, bytes)| async move {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-                Ok::<_, Infallible>(Bytes::from(bytes))
-            });
-            respond(status, &headers, Body::from_stream(stream))
-        }
+        }) => respond(status, &headers, chunked(chunks)),
         Some(Reply::Echo) => respond(
             200,
             &owned(&[("content-type", "text/event-stream")]),
-            Body::from(echo(&body)),
+            Body::from(sse(&echo_events(&body))),
         ),
+        Some(Reply::EchoSlow { delay_ms }) => {
+            let chunks = echo_events(&body)
+                .iter()
+                .map(|ev| (delay_ms, sse(std::slice::from_ref(ev))))
+                .collect();
+            respond(
+                200,
+                &owned(&[("content-type", "text/event-stream")]),
+                chunked(chunks),
+            )
+        }
     }
+}
+
+/// Each chunk is sent after its delay in milliseconds.
+fn chunked(chunks: Vec<(u64, Vec<u8>)>) -> Body {
+    let stream = futures_util::stream::iter(chunks).then(|(delay, bytes)| async move {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        Ok::<_, Infallible>(Bytes::from(bytes))
+    });
+    Body::from_stream(stream)
 }
 
 fn respond(status: u16, headers: &[(String, String)], body: Body) -> Response {
@@ -208,7 +224,7 @@ fn respond(status: u16, headers: &[(String, String)], body: Body) -> Response {
     r
 }
 
-fn echo(request: &[u8]) -> Vec<u8> {
+fn echo_events(request: &[u8]) -> Vec<(&'static str, Value)> {
     let v: Value = serde_json::from_slice(request).unwrap_or(Value::Null);
     let content = v["messages"]
         .as_array()
@@ -246,7 +262,24 @@ fn echo(request: &[u8]) -> Vec<u8> {
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}),
     ));
     events.push(("message_stop", json!({"type":"message_stop"})));
-    sse(&events)
+    events
+}
+
+/// A reply that is only `message_stop`.
+pub fn stop_only() -> Vec<u8> {
+    sse(&[("message_stop", json!({"type":"message_stop"}))])
+}
+
+/// Asserts a Tacita error response and returns its message.
+pub async fn tacita_error(resp: reqwest::Response, status: u16) -> String {
+    assert_eq!(resp.status(), status);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    let v: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    let msg = v["error"]["message"].as_str().unwrap().to_string();
+    assert!(msg.starts_with("Tacita: "), "{msg}");
+    msg
 }
 
 /// `event: <name>\ndata: <compact json>\n\n` for each event.

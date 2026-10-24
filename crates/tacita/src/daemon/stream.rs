@@ -15,7 +15,7 @@ use tacita_core::sse::{SseEvent, SseParser};
 use tokio::time::{Instant, timeout_at};
 
 use super::metalog::observe;
-use super::{MetaHandle, Timing, bounded};
+use super::{MetaHandle, Timing, bounded, short_reason};
 
 /// Tacita's own keep-alive, sent only while a tool call is held.
 pub const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
@@ -89,7 +89,8 @@ impl Restoring {
                     }
                     self.feed(&chunk)
                 }
-                Some(Err(_)) | None => self.upstream_ended(),
+                Some(Err(e)) => self.upstream_ended(Some(short_reason(&e))),
+                None => self.upstream_ended(None),
             };
             if !out.is_empty() {
                 return Some(self.sent(out));
@@ -106,15 +107,30 @@ impl Restoring {
     /// Parses `chunk` and pushes its events through the restorer.
     fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
         // `push` returns the events before a parse error and the error on
-        // the next call; the empty push surfaces it now.
+        // the next call; the empty push surfaces it now. Whatever events it
+        // returns are forwarded too, never dropped.
         let (events, parse_error) = match self.parser.push(chunk) {
-            Ok(events) => (events, self.parser.push(&[]).err()),
+            Ok(mut events) => match self.parser.push(&[]) {
+                Ok(more) => {
+                    events.extend(more);
+                    (events, None)
+                }
+                Err(e) => (events, Some(e)),
+            },
             Err(e) => (Vec::new(), Some(e)),
         };
         let mut out = Vec::new();
         for ev in events {
             match self.restorer.push(ev) {
-                Ok(emitted) => self.pass_on(emitted, &mut out),
+                Ok(emitted) => {
+                    if self.pass_on(emitted, &mut out) {
+                        // The upstream's own error ends the reply: drop any
+                        // held tool call and stop.
+                        self.finish_restorer(&mut out);
+                        self.done = true;
+                        return out;
+                    }
+                }
                 Err(e) => {
                     self.fail(&e.to_string(), &mut out);
                     return out;
@@ -137,14 +153,23 @@ impl Restoring {
         }
     }
 
-    fn pass_on(&mut self, events: Vec<SseEvent>, out: &mut Vec<u8>) {
+    /// Observes and appends upstream-derived events; returns whether one
+    /// was an upstream `error` event.
+    fn pass_on(&mut self, events: Vec<SseEvent>, out: &mut Vec<u8>) -> bool {
+        let mut upstream_error = false;
         for ev in events {
             observe(&mut self.m.meta, &ev);
-            if matches!(ev.event.as_deref(), Some("message_stop" | "error")) {
-                self.complete = true;
+            match ev.event.as_deref() {
+                Some("message_stop") => self.complete = true,
+                Some("error") => {
+                    self.complete = true;
+                    upstream_error = true;
+                }
+                _ => {}
             }
             out.extend_from_slice(&ev.raw);
         }
+        upstream_error
     }
 
     /// Ends the stream with Tacita's own error event.
@@ -168,11 +193,8 @@ impl Restoring {
         self.sent(out)
     }
 
-    /// The upstream ended or broke: flush text carries, drop a held tool
-    /// call, and say so unless the reply was complete. An unfinished event
-    /// left in the parser is dropped.
-    fn upstream_ended(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// Flushes text carries and drops a held tool call.
+    fn finish_restorer(&mut self, out: &mut Vec<u8>) {
         for ev in self.restorer.finish() {
             // `finish` makes no `error` event but its own (a probe hit).
             if ev.event.as_deref() == Some("error") {
@@ -181,11 +203,26 @@ impl Restoring {
                     self.m.meta.tacita_error.get_or_insert(reason);
                 }
             } else {
-                self.pass_on(vec![ev], &mut out);
+                self.pass_on(vec![ev], out);
             }
         }
+    }
+
+    /// The upstream ended, or broke with `cause`: flush text carries, drop a
+    /// held tool call, and say so unless the reply was complete. The log
+    /// also gets the cause. An unfinished event left in the parser is
+    /// dropped.
+    fn upstream_ended(&mut self, cause: Option<String>) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.finish_restorer(&mut out);
         if !self.complete {
             self.fail(CUT_OFF, &mut out);
+            let logged = &mut self.m.meta.tacita_error;
+            if let Some(cause) = cause
+                && logged.as_deref() == Some(CUT_OFF)
+            {
+                *logged = Some(bounded(&format!("{CUT_OFF}: {cause}")).to_string());
+            }
         }
         self.done = true;
         out
@@ -236,14 +273,22 @@ mod tests {
     /// Runs `chunks` through `restoring_body`; returns the client bytes and
     /// the meta line.
     async fn run(chunks: Vec<Vec<u8>>, restorer: Restorer) -> (String, Value) {
+        let upstream = futures_util::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from(c))));
+        run_stream(upstream, restorer, Timing::default()).await
+    }
+
+    async fn run_stream(
+        upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+        restorer: Restorer,
+        timing: Timing,
+    ) -> (String, Value) {
         let home = tempfile::tempdir().unwrap();
         let m = MetaHandle {
             meta: RequestMeta::default(),
             log: Arc::new(MetaLog::open(home.path()).unwrap()),
             start: std::time::Instant::now(),
         };
-        let upstream = futures_util::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from(c))));
-        let body = restoring_body(upstream, restorer, Timing::default(), m);
+        let body = restoring_body(upstream, restorer, timing, m);
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let line = std::fs::read_to_string(home.path().join("logs/requests.jsonl")).unwrap();
         let lines: Vec<&str> = line.lines().collect();
@@ -252,6 +297,54 @@ mod tests {
             String::from_utf8(bytes.to_vec()).unwrap(),
             serde_json::from_str(lines[0]).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn hold_limit_is_checked_on_each_chunk_when_the_upstream_never_waits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let mut chunks = vec![sse(&[(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}),
+        )])];
+        for _ in 0..20 {
+            chunks.push(sse(&[(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            )]));
+        }
+        chunks.push(sse(&[
+            (
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+            ("message_stop", json!({"type":"message_stop"})),
+        ]));
+        // Every poll is ready at once, after 30 ms of blocking work: the
+        // timeout never gets to fire (it polls the upstream first) and no
+        // ping is due within 10 s. Only the check made before each chunk is
+        // pushed can end the hold.
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let upstream = futures_util::stream::iter(chunks).map(move |c| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(Bytes::from(c))
+        });
+        let timing = Timing {
+            ping_every: Duration::from_secs(10),
+            hold_limit: Duration::from_millis(100),
+            ..Timing::default()
+        };
+        let restorer = Restorer::new(pairs(), Limits::default(), None);
+        let (out, meta) = run_stream(upstream, restorer, timing).await;
+        let message = "a tool call took longer than 0.1 s to arrive and was not passed on";
+        assert_eq!(out.as_bytes(), error_event(message).raw, "{out}");
+        assert_eq!(meta["tacita_error"], message);
+        // The start at 30 ms, then deltas at 60, 90, 120 and 150 ms: the
+        // first chunk past the 130 ms deadline ends it, long before the end.
+        let n = pulled.load(Ordering::SeqCst);
+        assert!((4..10).contains(&n), "{n}");
     }
 
     #[test]
