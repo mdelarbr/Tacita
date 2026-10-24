@@ -145,6 +145,7 @@ struct HeldTool {
 /// The events Tacita handles. Every other event is forwarded untouched.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
+    MessageStart,
     Start,
     Delta,
     Stop,
@@ -156,6 +157,7 @@ enum Kind {
 impl Kind {
     fn from_name(name: &str) -> Option<Kind> {
         Some(match name {
+            "message_start" => Kind::MessageStart,
             "content_block_start" => Kind::Start,
             "content_block_delta" => Kind::Delta,
             "content_block_stop" => Kind::Stop,
@@ -208,6 +210,7 @@ impl Restorer {
             (None, Some(_), _) => return Err(bad("an event's name does not match its data")),
         };
         match kind {
+            Kind::MessageStart => message_start(ev, &v),
             Kind::Start => self.start(ev, &v),
             Kind::Delta => self.delta(ev, &v),
             Kind::Stop => self.stop(ev, &v),
@@ -255,17 +258,32 @@ impl Restorer {
         if index.is_some_and(|i| self.texts.contains_key(&i)) {
             return Err(bad("a block started at the index of an open text block"));
         }
-        match v.get("content_block").and_then(type_of) {
+        let block = v.get("content_block");
+        match block.and_then(type_of) {
             Some("text") => {
                 let index = index.ok_or_else(|| bad("text block without an index"))?;
+                // Text in the start would skip the restore.
+                let empty = match block.and_then(|b| b.get("text")) {
+                    None => true,
+                    Some(Value::String(t)) => t.is_empty(),
+                    Some(_) => false,
+                };
+                if !empty {
+                    return Err(bad("a text block started with text"));
+                }
                 self.texts.insert(index, TextBlock::default());
                 Ok(vec![ev])
             }
             Some("tool_use") => {
                 let index = index.ok_or_else(|| bad("tool call without an index"))?;
+                let input = block.and_then(|b| b.get("input"));
+                let start = match input {
+                    Some(Value::Object(m)) if m.is_empty() => ev,
+                    _ => self.restore_start_input(ev)?,
+                };
                 self.held = Some(HeldTool {
                     index,
-                    start: ev,
+                    start,
                     first_delta: None,
                     input: String::new(),
                 });
@@ -273,6 +291,27 @@ impl Restorer {
             }
             _ => Ok(vec![ev]),
         }
+    }
+
+    /// Restores every key and value literal under `content_block.input` of
+    /// a tool call's start, by the rules of held tool input. The event is
+    /// returned unchanged when there is nothing to restore.
+    fn restore_start_input(&mut self, ev: SseEvent) -> Result<SseEvent, RestoreError> {
+        let data = ev.data.as_bytes();
+        let lits = scan(data).map_err(|_| bad("a tool call start could not be read"))?;
+        let input = lits.into_iter().filter(|l| match l.path.as_slice() {
+            // Everything under `input`, but not the key `input` itself.
+            [Seg::Key(b), Seg::Key(i), rest @ ..] if b == "content_block" && i == "input" => {
+                !(rest.is_empty() && l.is_key)
+            }
+            _ => false,
+        });
+        let Some(restored) = self.restore_lits(data, input)? else {
+            return Ok(ev);
+        };
+        let restored =
+            String::from_utf8(restored).map_err(|_| bad("restored tool call start is not UTF-8"))?;
+        Ok(SseEvent::build("content_block_start", &restored))
     }
 
     fn delta(&mut self, ev: SseEvent, v: &Value) -> Result<Vec<SseEvent>, RestoreError> {
@@ -368,8 +407,21 @@ impl Restorer {
     /// any stand-in that reaches a tool call.
     fn restore_tool_input(&mut self, input: &str) -> Result<String, RestoreError> {
         let bytes = input.as_bytes();
+        let Some(restored) = self.restore_lits(bytes, scan_tolerant(bytes))? else {
+            return Ok(input.to_string());
+        };
+        String::from_utf8(restored).map_err(|_| bad("restored tool call input is not UTF-8"))
+    }
+
+    /// Replaces the stand-ins inside `lits` (sorted literals of `bytes`),
+    /// every other byte unchanged; `None` when there were none.
+    fn restore_lits(
+        &mut self,
+        bytes: &[u8],
+        lits: impl IntoIterator<Item = Lit>,
+    ) -> Result<Option<Vec<u8>>, RestoreError> {
         let mut edits = Vec::new();
-        for lit in scan_tolerant(bytes) {
+        for lit in lits {
             let raw = &bytes[lit.span.clone()];
             let decoded = decode(raw).map_err(|_| bad("tool call input has an invalid string"))?;
             let found = self.pairs.find_standins(&decoded.text);
@@ -379,8 +431,17 @@ impl Restorer {
             self.restored += found.len();
             edits.push((lit.span, replace(raw, &decoded, &found)));
         }
-        String::from_utf8(splice(bytes, edits))
-            .map_err(|_| bad("restored tool call input is not UTF-8"))
+        Ok((!edits.is_empty()).then(|| splice(bytes, edits)))
+    }
+}
+
+/// A `message_start` carrying content would skip the restore: only an
+/// absent, null or empty `message.content` goes on.
+fn message_start(ev: SseEvent, v: &Value) -> Result<Vec<SseEvent>, RestoreError> {
+    match v.pointer("/message/content") {
+        None | Some(Value::Null) => Ok(vec![ev]),
+        Some(Value::Array(a)) if a.is_empty() => Ok(vec![ev]),
+        Some(_) => Err(bad("a message started with content")),
     }
 }
 
@@ -826,6 +887,7 @@ mod tests {
     #[test]
     fn handled_event_with_non_object_data_fails_closed() {
         for name in [
+            "message_start",
             "content_block_start",
             "content_block_delta",
             "content_block_stop",
@@ -869,6 +931,7 @@ mod tests {
     #[test]
     fn handled_event_names_need_data() {
         for name in [
+            "message_start",
             "content_block_start",
             "content_block_delta",
             "content_block_stop",
@@ -934,7 +997,7 @@ mod tests {
         let mut r = restorer();
         r.push(text_start(0)).unwrap();
         r.push(text_delta(0, "a client_x0")).unwrap();
-        let start = json!({"type":"message_start","message":{"content":[{"type":"text","text":"client_x01"}]}});
+        let start = json!({"type":"message_start","message":{"content":[],"model":"client_x01"}});
         for e in [
             named(Some("ping"), r#"{"type": "ping"}"#),
             named(None, r#"{"type":"ping"}"#),
@@ -943,6 +1006,87 @@ mod tests {
             named(Some("message_start"), &start.to_string()),
         ] {
             assert_eq!(r.push(e.clone()).unwrap(), vec![e]);
+        }
+    }
+    #[test]
+    fn text_block_starting_with_text_fails_closed() {
+        for text in [json!("client_x01"), json!("hi"), json!(5)] {
+            let start = ev(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":text}}),
+            );
+            let res = restorer().push(start);
+            assert!(
+                matches!(&res, Err(RestoreError::BadEvent(m)) if m == "a text block started with text"),
+                "{text}: {res:?}"
+            );
+        }
+        // The normal start has an empty text.
+        assert_eq!(restorer().push(text_start(0)).unwrap(), vec![text_start(0)]);
+    }
+    fn tool_start_with(input: Value) -> SseEvent {
+        ev(
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_client_x01","name":"client_x01","input":input}}),
+        )
+    }
+    #[test]
+    fn tool_input_in_the_start_event_is_restored() {
+        let mut r = restorer();
+        let out = run(
+            &mut r,
+            vec![
+                tool_start_with(json!({"client_x01":"/a/client_x01","n":[1,"ClientX01"]})),
+                stop(1),
+            ],
+        );
+        // Only `input` is restored: keys and values, nothing else.
+        let want = tool_start_with(json!({"acmewidgets":"/a/acmewidgets","n":[1,"AcmeWidgets"]}));
+        assert_eq!(out, vec![want, stop(1)]);
+        assert_eq!(r.restored(), 3);
+        // With deltas after it, both are restored.
+        let mut r = restorer();
+        let out = run(
+            &mut r,
+            vec![
+                tool_start_with(json!({"k":"client_x01"})),
+                tool_delta(1, "{\"q\":\"client_x01\"}"),
+                stop(1),
+            ],
+        );
+        assert_eq!(out[0], tool_start_with(json!({"k":"acmewidgets"})));
+        assert_eq!(data(&out[1])["delta"]["partial_json"], "{\"q\":\"acmewidgets\"}");
+        assert_eq!(r.restored(), 2);
+    }
+    #[test]
+    fn tool_start_without_stand_ins_is_held_byte_identical() {
+        let start = tool_start_with(json!({"path":"/a/b"}));
+        let out = run(&mut restorer(), vec![start.clone(), stop(1)]);
+        assert_eq!(out, vec![start, stop(1)]);
+    }
+    #[test]
+    fn message_start_with_content_fails_closed() {
+        for content in [
+            json!([{"type":"text","text":"client_x01"}]),
+            json!([{"type":"text","text":""}]),
+            json!("client_x01"),
+        ] {
+            let e = ev(
+                "message_start",
+                json!({"type":"message_start","message":{"content":content}}),
+            );
+            let res = restorer().push(e);
+            assert!(
+                matches!(&res, Err(RestoreError::BadEvent(m)) if m == "a message started with content"),
+                "{content}: {res:?}"
+            );
+        }
+        for message in [json!({"content":[]}), json!({"content":null}), json!({})] {
+            let e = ev(
+                "message_start",
+                json!({"type":"message_start","message":message}),
+            );
+            assert_eq!(restorer().push(e.clone()).unwrap(), vec![e]);
         }
     }
     #[test]
