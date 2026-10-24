@@ -301,10 +301,11 @@ async fn pings_sent_while_holding() {
 #[tokio::test]
 async fn pings_continue_while_held_deltas_arrive() {
     let mut chunks = vec![(0, vec![message_start(), tool_start(1)])];
-    for _ in 0..12 {
-        chunks.push((40, vec![tool_delta(1, "{}")]));
+    // The parts make one JSON value: `[0,0,…,0]`.
+    for i in 0..12 {
+        chunks.push((40, vec![tool_delta(1, if i == 0 { "[0" } else { ",0" })]));
     }
-    let mut end = vec![block_stop(1)];
+    let mut end = vec![tool_delta(1, "]"), block_stop(1)];
     end.extend(message_end());
     chunks.push((0, end));
     let up = FakeUpstream::start(vec![sse_reply(chunks)]).await;

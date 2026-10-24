@@ -402,12 +402,18 @@ impl Restorer {
         Ok(out)
     }
 
-    /// Restores every complete key and value literal of the tool input.
-    /// Literals after a scan error stay as they are; the guard hook blocks
-    /// any stand-in that reaches a tool call.
+    /// Restores every key and value literal of the tool input. Input that
+    /// simply ends early (a max_tokens cut) is restored up to the cut; any
+    /// other scan error fails closed, since the literals after it would
+    /// keep their stand-ins.
     fn restore_tool_input(&mut self, input: &str) -> Result<String, RestoreError> {
         let bytes = input.as_bytes();
-        let Some(restored) = self.restore_lits(bytes, scan_tolerant(bytes))? else {
+        let lits = match scan(bytes) {
+            Ok(lits) => lits,
+            Err(e) if ended_early(bytes, &e) => scan_tolerant(bytes),
+            Err(_) => return Err(bad("a tool call's input could not be read")),
+        };
+        let Some(restored) = self.restore_lits(bytes, lits)? else {
             return Ok(input.to_string());
         };
         String::from_utf8(restored).map_err(|_| bad("restored tool call input is not UTF-8"))
@@ -433,6 +439,22 @@ impl Restorer {
         }
         Ok((!edits.is_empty()).then(|| splice(bytes, edits)))
     }
+}
+
+/// Whether a strict scan of `input` failed only because the input ended:
+/// the error is at its end, or what is left from the error on is the start
+/// of a `true`, `false` or `null`, or of a `\u` escape.
+fn ended_early(input: &[u8], e: &ScanError) -> bool {
+    if matches!(e.reason, "too deep" | "too complex") {
+        return false;
+    }
+    let tail = input.get(e.offset..).unwrap_or_default();
+    let starts = |whole: &[u8]| tail.len() < whole.len() && whole.starts_with(tail);
+    tail.is_empty()
+        || starts(b"true")
+        || starts(b"false")
+        || starts(b"null")
+        || (tail.starts_with(b"\\u") && tail.len() < 6 && tail[2..].iter().all(u8::is_ascii_hexdigit))
 }
 
 /// A `message_start` carrying content would skip the restore: only an
@@ -842,19 +864,30 @@ mod tests {
         assert_eq!(out, vec![tool_start(0), stop(0)]);
     }
     #[test]
-    fn tool_input_after_scan_error_is_left_as_is() {
-        let out = run(
-            &mut restorer(),
-            vec![
-                tool_start(0),
-                tool_delta(0, "{\"a\":\"client_x01\", oops \"b\":\"client_x01\"}"),
-                stop(0),
-            ],
-        );
-        assert_eq!(
-            data(&out[1])["delta"]["partial_json"],
-            "{\"a\":\"acmewidgets\", oops \"b\":\"client_x01\"}"
-        );
+    fn tool_input_cut_short_is_restored_up_to_the_cut() {
+        // A max_tokens cut: the input simply ends, wherever that falls.
+        for tail in ["\"cli", "tru", "nul", "fals", "-", "1.", "1e", "\"\\u00", "\"\\", "[", "{\"k\""] {
+            let input = format!("{{\"a\":\"client_x01\",\"b\":{tail}");
+            let out = run(&mut restorer(), vec![tool_start(0), tool_delta(0, &input), stop(0)]);
+            let want = input.replacen("client_x01", "acmewidgets", 1);
+            assert_eq!(data(&out[1])["delta"]["partial_json"], want.as_str(), "{tail}");
+        }
+    }
+    #[test]
+    fn tool_input_scan_error_before_its_end_fails_closed() {
+        let deep = format!("{}{}", "[".repeat(600), "]".repeat(600));
+        for input in [
+            format!("{{\"a\":\"client_x01\",\"d\":{deep},\"b\":\"client_x01\"}}"),
+            "{\"a\":\"client_x01\", oops \"b\":\"client_x01\"}".to_string(),
+            "{\"a\":\"client_x01\",\"b\":trux,\"c\":\"client_x01\"}".to_string(),
+            "{\"a\":\"client_x01\"} \"client_x01\"".to_string(),
+        ] {
+            let res = try_run(&mut restorer(), vec![tool_start(0), tool_delta(0, &input), stop(0)]);
+            assert!(
+                matches!(&res, Err(RestoreError::BadEvent(m)) if m == "a tool call's input could not be read"),
+                "{input:.40}: {res:?}"
+            );
+        }
     }
     #[test]
     fn foreign_block_events_during_hold_fail_closed() {
