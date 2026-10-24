@@ -1,8 +1,9 @@
 //! Upstream request headers, the HTTP client, and response header filtering.
 
-use axum::http::header::{ACCEPT_ENCODING, CONNECTION};
+use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONNECTION};
 use axum::http::{HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
+use tacita_core::openrouter::adapt_beta;
 
 use super::Timing;
 
@@ -47,6 +48,36 @@ pub fn anthropic_headers(incoming: &HeaderMap, protected: bool) -> HeaderMap {
         out.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     }
     out
+}
+
+/// OpenRouter's request headers, built from an allowlist: `content-type`,
+/// `accept` and `anthropic-version` are copied, `anthropic-beta` loses its
+/// `oauth-*` items, `authorization` is the OpenRouter key. Nothing else
+/// from the incoming request goes. `None` when the key cannot be a header
+/// value.
+pub fn openrouter_headers(incoming: &HeaderMap, key: &str) -> Option<HeaderMap> {
+    let mut auth = HeaderValue::from_str(&format!("Bearer {key}")).ok()?;
+    auth.set_sensitive(true);
+    let mut out = HeaderMap::new();
+    for name in ["content-type", "accept", "anthropic-version"] {
+        for value in incoming.get_all(name) {
+            out.append(name, value.clone());
+        }
+    }
+    let beta: Vec<String> = incoming
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(adapt_beta)
+        .collect();
+    if !beta.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&beta.join(","))
+    {
+        out.insert("anthropic-beta", value);
+    }
+    out.insert(AUTHORIZATION, auth);
+    out.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    Some(out)
 }
 
 /// The upstream's headers for the client. `content-length` goes when the
@@ -183,6 +214,47 @@ mod tests {
         assert!(!kept(true).contains(&"content-length".to_string()));
         assert_eq!(kept(true).len(), 6);
         assert_eq!(response_headers(&h, false)["retry-after"], "30");
+    }
+
+    #[test]
+    fn openrouter_headers_are_an_allowlist() {
+        let h = headers(&[
+            ("host", "127.0.0.1:1"),
+            ("content-type", "application/json"),
+            ("accept", "text/event-stream"),
+            ("anthropic-version", "2023-06-01"),
+            ("anthropic-beta", "oauth-2025-04-20,claude-code-20250219"),
+            ("anthropic-beta", "interleaved-thinking-2025-05-14"),
+            ("authorization", "Bearer sk-ant-oat01-T"),
+            ("x-api-key", "sk-ant-api03-X"),
+            ("cookie", "a=b"),
+            ("x-claude-code-session-id", "s"),
+            ("anthropic-dangerous-direct-browser-access", "true"),
+            ("accept-encoding", "gzip"),
+        ]);
+        let out = openrouter_headers(&h, "sk-or-v1-K").unwrap();
+        assert_eq!(
+            pairs(&out),
+            vec![
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                (
+                    "anthropic-beta".into(),
+                    "claude-code-20250219,interleaved-thinking-2025-05-14".into()
+                ),
+                ("authorization".into(), "Bearer sk-or-v1-K".into()),
+                ("accept-encoding".into(), "identity".into()),
+            ]
+        );
+        let only_oauth = headers(&[("anthropic-beta", "oauth-2025-04-20")]);
+        assert!(
+            openrouter_headers(&only_oauth, "k")
+                .unwrap()
+                .get("anthropic-beta")
+                .is_none()
+        );
+        assert!(openrouter_headers(&h, "bad\nkey").is_none());
     }
 
     #[test]

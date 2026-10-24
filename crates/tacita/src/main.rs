@@ -28,6 +28,11 @@ enum Cmd {
         #[command(subcommand)]
         provider: UseCmd,
     },
+    /// Store a provider key in the macOS Keychain
+    Key {
+        #[command(subcommand)]
+        action: KeyCmd,
+    },
     /// Run the proxy in the foreground on 127.0.0.1 (Ctrl-C stops it)
     Daemon,
 }
@@ -39,6 +44,46 @@ enum UseCmd {
         #[arg(long)]
         model: String,
     },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Prompt for the OpenRouter key (input hidden) and store it
+    Set {
+        #[arg(value_parser = ["openrouter"])]
+        name: String,
+    },
+}
+
+/// `Ok` with the trimmed key when it looks like an OpenRouter key. The
+/// error never carries the input.
+fn check_openrouter_key(input: &str) -> Result<&str, String> {
+    let key = input.trim();
+    if key.is_empty() {
+        return Err("no key entered".into());
+    }
+    if !key.starts_with("sk-or-") || !key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("that does not look like an OpenRouter key (sk-or-...)".into());
+    }
+    Ok(key)
+}
+
+#[cfg(target_os = "macos")]
+fn key_set(name: &str) -> Result<(), String> {
+    use tacita::secrets::{KeychainStore, SecretStore};
+    let input = rpassword::prompt_password("OpenRouter key (input hidden): ")
+        .map_err(|e| format!("cannot read the key: {e}"))?;
+    let key = check_openrouter_key(&input)?;
+    KeychainStore::new("dev.tacita")
+        .set(name, key)
+        .map_err(|e| format!("cannot store the key in the Keychain: {e}"))?;
+    println!("Stored in the macOS Keychain (service dev.tacita, account {name}).");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn key_set(_name: &str) -> Result<(), String> {
+    Err("the Keychain is only available on macOS".into())
 }
 
 fn parse_model(s: &str) -> Result<String, String> {
@@ -181,6 +226,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             state.save(&home).map_err(|e| e.to_string())?;
             print_status(&home, &cfg).await?;
         }
+        Cmd::Key {
+            action: KeyCmd::Set { name },
+        } => key_set(&name)?,
         Cmd::Daemon => run_daemon(home).await?,
     }
     Ok(())
@@ -192,5 +240,27 @@ async fn main() {
     if let Err(msg) = run(cli).await {
         eprintln!("tacita: {msg}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_openrouter_key;
+
+    #[test]
+    fn key_check_trims_and_refuses_without_echo() {
+        assert_eq!(check_openrouter_key("  sk-or-v1-abc\n"), Ok("sk-or-v1-abc"));
+        for bad in [
+            "",
+            "   ",
+            "sk-ant-oat01-SECRET",
+            "sk-or-a b",
+            "sk-or-\u{e9}x",
+            "sk-or-a\tb",
+        ] {
+            let e = check_openrouter_key(bad).unwrap_err();
+            assert!(!e.contains("SECRET") && !e.contains("a b"), "{e}");
+        }
+        assert_eq!(check_openrouter_key("").unwrap_err(), "no key entered");
     }
 }

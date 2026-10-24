@@ -22,6 +22,7 @@ use axum::response::Response;
 use axum::serve::ListenerExt;
 use futures_util::StreamExt;
 use tacita_core::errors::error_body;
+use tacita_core::openrouter::{Prefs, adapt_request};
 use tacita_core::pairs::Pairs;
 use tacita_core::request::scrub_request;
 
@@ -264,8 +265,8 @@ async fn messages(
         Protection::Off => "off",
         Protection::Pairs => "pairs",
     });
-    if state.provider != Provider::Anthropic {
-        return m.fail(StatusCode::BAD_REQUEST, "this mode is not built yet");
+    if state.provider == Provider::Openrouter {
+        return openrouter(app, m, headers, body, &state).await;
     }
     m.meta.model_out = m.meta.model_in.clone();
     let protected = protection != Protection::Off;
@@ -305,6 +306,81 @@ async fn messages(
         Ok(upstream) => pass_through(upstream, m),
         Err(e) => {
             let message = format!("cannot reach {}: {}", app.anthropic_host, short_reason(&e));
+            m.fail(StatusCode::BAD_GATEWAY, &message)
+        }
+    }
+}
+
+/// The OpenRouter route: model, key, scrub, adapt, then the same protected
+/// reply as the Anthropic path. Nothing is forwarded on any error, and only
+/// `openrouter_headers` and the adapted body reach OpenRouter.
+async fn openrouter(
+    app: &App,
+    mut m: MetaHandle,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+    state: &config::State,
+) -> Response {
+    let Some(slug) = state.openrouter_model.as_deref() else {
+        return m.fail(
+            StatusCode::BAD_REQUEST,
+            "no OpenRouter model: run `tacita use openrouter --model <slug>`",
+        );
+    };
+    let key = match app.opts.secrets.get("openrouter") {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return m.fail(
+                StatusCode::BAD_REQUEST,
+                "no OpenRouter key: run `tacita key set openrouter`",
+            );
+        }
+        Err(e) => {
+            let message = format!(
+                "cannot read the OpenRouter key from the Keychain: {}",
+                bounded(&e.to_string())
+            );
+            return m.fail(StatusCode::BAD_REQUEST, &message);
+        }
+    };
+    let Some(out_headers) = forward::openrouter_headers(headers, &key) else {
+        return m.fail(
+            StatusCode::BAD_REQUEST,
+            "the stored OpenRouter key is not usable; run `tacita key set openrouter` again",
+        );
+    };
+    let scrubbed = match scrub_request(&body, &app.pairs) {
+        Ok(s) => s,
+        Err(e) => {
+            let message = format!("could not read this request: {}", bounded(&e.to_string()));
+            return m.fail(StatusCode::BAD_REQUEST, &message);
+        }
+    };
+    m.meta.scrubbed = Some(scrubbed.replacements);
+    m.meta.scrubbed_system = Some(scrubbed.in_system);
+    let prefs = Prefs {
+        only: app.config.openrouter.only.clone(),
+    };
+    let body = match adapt_request(&scrubbed.body, slug, &prefs) {
+        Ok(b) => b,
+        Err(e) => return m.fail(StatusCode::BAD_REQUEST, bounded(&e.to_string())),
+    };
+    m.meta.model_out = Some(slug.to_string());
+    let url = format!(
+        "{}/v1/messages",
+        app.opts.openrouter_upstream.trim_end_matches('/')
+    );
+    match app
+        .client
+        .post(url)
+        .headers(out_headers)
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(upstream) => reply::protected_reply(app, upstream, m).await,
+        Err(e) => {
+            let message = format!("cannot reach OpenRouter: {}", short_reason(&e));
             m.fail(StatusCode::BAD_GATEWAY, &message)
         }
     }

@@ -595,7 +595,7 @@ async fn bad_state_is_a_visible_500() {
 }
 
 #[tokio::test]
-async fn unbuilt_modes_are_refused_visibly() {
+async fn openrouter_without_a_key_is_refused_visibly() {
     let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
     let or = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
     let openrouter = start_tacita(
@@ -614,7 +614,10 @@ async fn unbuilt_modes_are_refused_visibly() {
         .await
         .unwrap();
     let msg = tacita_error(resp, 400).await;
-    assert_eq!(msg, "Tacita: this mode is not built yet");
+    assert_eq!(
+        msg,
+        "Tacita: no OpenRouter key: run `tacita key set openrouter`"
+    );
     assert_eq!(up.count(), 0);
     assert_eq!(or.count(), 0);
     let o = &meta_lines(&openrouter, 1).await[0];
