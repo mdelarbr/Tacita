@@ -1,0 +1,28 @@
+{
+  "model": "claude-opus-5-5",
+  "max_tokens": 32000,
+  "temperature": 1.0,
+  "metadata": {"user_id": "{\"device_id\":\"acmewidgets-dev\",\"session_id\":\"s1\"}"},
+  "system": [
+    {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.300; cc_entrypoint=cli;"},
+    {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "Working directory: /Users/dev/code/acmewidgets\nGit branch: acmewidgets-main", "cache_control": {"type": "ephemeral"}}
+  ],
+  "tools": [
+    {"name": "mcp__acmewidgets__query", "description": "Query the acmewidgets database",
+     "input_schema": {"type": "object", "properties": {"acmewidgets_id": {"type": "string", "description": "An acmewidgets ID"}}, "required": ["acmewidgets_id"]}}
+  ],
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "text", "text": "Summarize acmewidgets/README.md"},
+      {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "acmewidgets"}}
+    ]},
+    {"role": "assistant", "content": [
+      {"type": "thinking", "thinking": "The user mentions acmewidgets.", "signature": "c2lnLWFjbWV3aWRnZXRz"},
+      {"type": "tool_use", "id": "toolu_acmewidgets", "name": "mcp__acmewidgets__query", "input": {"acmewidgets_id": "acmewidgets-42", "type": "acmewidgets"}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_acmewidgets", "content": [{"type": "text", "text": "Row: acmewidgets, owner Jeanne Fictive"}]}
+    ]}
+  ]
+}
