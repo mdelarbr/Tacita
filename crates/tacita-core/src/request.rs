@@ -221,14 +221,14 @@ mod tests {
   ],
   "tool_choice": {"type": "tool", "name": "acmewidgets"},
   "tools": [
-    {"name": "acmewidgets", "description": "acmewidgets", "cache_control": {"type": "acmewidgets"},
+    {"name": "acmewidgets", "description": "acmewidgets", "cache_control": {"type": "ephemeral", "note": "acmewidgets"},
      "input_schema": {"acmewidgets": "acmewidgets"},
      "input_examples": [{"acmewidgets": "acmewidgets"}]}
   ],
   "output_format": {"type": "json_schema", "schema": {"acmewidgets": "acmewidgets"}},
   "messages": [
     {"role": "user", "content": [
-      {"type": "text", "text": "hi", "cache_control": {"type": "acmewidgets"}},
+      {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "note": "acmewidgets"}},
       {"type": "image", "source": {"type": "base64", "media_type": "acmewidgets", "data": "acmewidgets"}},
       {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "acmewidgets"}},
       {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "acmewidgets"}},
@@ -282,7 +282,7 @@ mod tests {
         for p in scrubbed {
             assert!(!v.pointer(p).unwrap().to_string().contains("acmewidgets"), "{p}");
         }
-        // 13 single hits, plus a key and a value in each of the four user-data subtrees.
+        // 9 single hits, plus a key and a value in each of the four user-data subtrees.
         assert_eq!(s.replacements, 9 + 8);
         assert_eq!(s.in_system, 1);
     }
