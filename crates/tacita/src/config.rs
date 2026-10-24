@@ -32,7 +32,7 @@ pub struct OpenRouterCfg {
     pub only: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step0Cfg {
     #[serde(default)]
@@ -43,7 +43,7 @@ pub struct Step0Cfg {
     pub record_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub port: u16,
@@ -52,6 +52,30 @@ pub struct Config {
     pub openrouter: OpenRouterCfg,
     #[serde(default)]
     pub step0: Step0Cfg,
+}
+
+impl std::fmt::Debug for Step0Cfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Step0Cfg")
+            .field("pairs", &format_args!("[{} hidden]", self.pairs.len()))
+            .field("block_probe", &self.block_probe)
+            .field("stream_probe", &self.stream_probe)
+            .field("guard_probe", &self.guard_probe)
+            .field("record_dir", &self.record_dir)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("secret", &"[hidden]")
+            .field("anthropic", &self.anthropic)
+            .field("openrouter", &self.openrouter)
+            .field("step0", &self.step0)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -69,8 +93,10 @@ pub struct State {
     pub openrouter_model: Option<String>,
 }
 
-/// Display text never contains a real value or the secret.
-#[derive(Debug, thiserror::Error)]
+/// Display text never contains a real value or the secret. `Pairs` has no
+/// `source()` because anyhow would walk it and print PairsError's values;
+/// Debug is the same text as Display for the same reason.
+#[derive(thiserror::Error)]
 pub enum ConfigError {
     #[error("I/O error on {file}: {source}")]
     Io {
@@ -91,11 +117,23 @@ pub enum ConfigError {
     #[error("openrouter.protection = \"off\" is refused")]
     OpenRouterUnprotected,
     #[error("{}", pairs_text(.0))]
-    Pairs(#[source] PairsError),
+    Pairs(PairsError),
     #[error("step0.record_dir must be an absolute path")]
     RecordDirNotAbsolute,
+    #[error("config.toml already exists; refusing to overwrite it")]
+    ConfigExists,
+    #[error(
+        "state.toml: provider openrouter needs a model; run `tacita use openrouter --model <slug>`"
+    )]
+    StateNoModel,
     #[error("step0.{0} must not be empty")]
     EmptyProbe(&'static str),
+}
+
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 fn pairs_text(e: &PairsError) -> &'static str {
@@ -185,8 +223,15 @@ impl Config {
         let secret: String = raw.iter().map(|b| format!("{b:02x}")).collect();
         crate::paths::ensure_private_dir(home).map_err(|e| io_err("Tacita home", e))?;
         let text = DEFAULT_CONFIG.replace("{secret}", &secret);
-        write_private(&home.join(CONFIG_FILE), text.as_bytes())
-            .map_err(|e| io_err(CONFIG_FILE, e))?;
+        crate::paths::create_private_new(&home.join(CONFIG_FILE), text.as_bytes()).map_err(
+            |e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    ConfigError::ConfigExists
+                } else {
+                    io_err(CONFIG_FILE, e)
+                }
+            },
+        )?;
         Config::load(home)
     }
 
@@ -227,7 +272,13 @@ impl State {
     /// A missing file means Anthropic.
     pub fn load(home: &Path) -> Result<State, ConfigError> {
         match std::fs::read_to_string(home.join(STATE_FILE)) {
-            Ok(text) => toml::from_str(&text).map_err(|e| toml_err(STATE_FILE, &text, e)),
+            Ok(text) => {
+                let s: State = toml::from_str(&text).map_err(|e| toml_err(STATE_FILE, &text, e))?;
+                if s.provider == Provider::Openrouter && s.openrouter_model.is_none() {
+                    return Err(ConfigError::StateNoModel);
+                }
+                Ok(s)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State {
                 provider: Provider::Anthropic,
                 openrouter_model: None,
@@ -324,15 +375,7 @@ mod tests {
         ] {
             assert!(!shown.contains(leak), "{shown}");
         }
-        assert!(std::error::Error::source(&err).is_some());
-    }
-
-    #[test]
-    fn empty_pairs_ok_when_nobody_uses_them() {
-        // anthropic off, openrouter pairs: pairs are needed
-        let text = default_text().replace("pairs = [", "pairs_x = [");
-        let t = home_with(&text);
-        assert!(Config::load(t.path()).is_err());
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     #[test]
@@ -373,12 +416,10 @@ mod tests {
 
     #[test]
     fn record_dir_must_be_absolute() {
-        let t = home_with(&(default_text() + "\n"));
         let text = default_text().replace(
             "# record_dir = \"/Users/you/tacita-corpus\"",
             "record_dir = \"corpus\"",
         );
-        drop(t);
         let t = home_with(&text);
         assert!(matches!(
             Config::load(t.path()),
@@ -387,6 +428,103 @@ mod tests {
         let ok = default_text().replace("# record_dir = \"/Users/you", "record_dir = \"/Users/you");
         let t = home_with(&ok);
         assert!(Config::load(t.path()).is_ok());
+    }
+
+    #[test]
+    fn unknown_fields_are_refused_everywhere() {
+        let cases: Vec<(&str, String)> = vec![
+            ("top-level", format!("extra = 1\n{}", default_text())),
+            (
+                "anthropic",
+                default_text().replace("[anthropic]\n", "[anthropic]\nextra = 1\n"),
+            ),
+            (
+                "openrouter",
+                default_text().replace("[openrouter]\n", "[openrouter]\nextra = 1\n"),
+            ),
+            (
+                "pair",
+                default_text().replace(
+                    "{ real = \"acmewidgets\", standin = \"client_x01\" }",
+                    "{ real = \"acmewidgets\", standin = \"client_x01\", note = \"x\" }",
+                ),
+            ),
+        ];
+        for (name, text) in cases {
+            let t = home_with(&text);
+            let e = Config::load(t.path()).unwrap_err();
+            assert!(matches!(e, ConfigError::Toml { .. }), "{name}: {e}");
+            assert!(e.to_string().contains("unknown field"), "{name}: {e}");
+        }
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(
+            t.path().join(STATE_FILE),
+            "provider = \"anthropic\"\nextra = 1\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            State::load(t.path()),
+            Err(ConfigError::Toml { .. })
+        ));
+    }
+
+    #[test]
+    fn debug_and_anyhow_hide_secrets_and_real_values() {
+        let secret = "ab".repeat(16);
+        let hidden = |s: &str| {
+            for leak in [
+                secret.as_str(),
+                "acmewidgets",
+                "AcmeWidgets",
+                "Jeanne",
+                "person_x01",
+                "client_x01",
+            ] {
+                assert!(!s.contains(leak), "{leak} in {s}");
+            }
+        };
+        let t = home_with(&default_text());
+        let cfg = Config::load(t.path()).unwrap();
+        let d = format!("{cfg:?}");
+        hidden(&d);
+        assert!(d.contains("[hidden]"), "{d}");
+        hidden(&format!("{:?}", cfg.step0));
+        let bad = default_text().replace("\"client_x01\"", "\"person_x01\"");
+        let t = home_with(&bad);
+        let err = Config::load(t.path()).unwrap_err();
+        assert!(std::error::Error::source(&err).is_none());
+        let shown = err.to_string();
+        assert_eq!(format!("{err:?}"), shown);
+        hidden(&shown);
+        let any = anyhow::Error::from(err);
+        hidden(&format!("{any:#}"));
+        hidden(&format!("{any:?}"));
+    }
+
+    #[test]
+    fn create_default_never_overwrites() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join(CONFIG_FILE), "mine").unwrap();
+        let e = Config::create_default(t.path()).unwrap_err();
+        assert!(matches!(e, ConfigError::ConfigExists), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(t.path().join(CONFIG_FILE)).unwrap(),
+            "mine"
+        );
+        let names: Vec<_> = std::fs::read_dir(t.path()).unwrap().collect();
+        assert_eq!(names.len(), 1, "temp file left behind");
+    }
+
+    #[test]
+    fn state_openrouter_needs_a_model() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join(STATE_FILE), "provider = \"openrouter\"\n").unwrap();
+        let e = State::load(t.path()).unwrap_err();
+        assert!(matches!(e, ConfigError::StateNoModel));
+        assert_eq!(
+            e.to_string(),
+            "state.toml: provider openrouter needs a model; run `tacita use openrouter --model <slug>`"
+        );
     }
 
     #[test]

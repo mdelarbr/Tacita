@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pair {
     pub real: String,
     pub standin: String,

@@ -149,3 +149,80 @@ fn status_detects_a_running_daemon_only_on_200() {
     assert!(out(&run_in(home.path(), &["status"])).contains("daemon:     not running"));
     server.join().unwrap();
 }
+
+fn run_with_proxies(home: &std::path::Path, proxy: &str, args: &[&str]) -> Output {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_tacita"));
+    c.args(args).env("TACITA_HOME", home);
+    for k in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY"] {
+        c.env(k, proxy);
+    }
+    c.output().unwrap()
+}
+
+fn init_on_port(home: &std::path::Path, port: u16) {
+    run_in(home, &["init"]);
+    let cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        cfg.replace("47821", &port.to_string()),
+    )
+    .unwrap();
+}
+
+fn spy() -> (std::net::TcpListener, u16) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let p = l.local_addr().unwrap().port();
+    (l, p)
+}
+
+fn untouched(l: &std::net::TcpListener) -> bool {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    matches!(l.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+#[test]
+fn status_never_uses_a_proxy() {
+    use std::io::{Read, Write};
+    let home = tempfile::tempdir().unwrap();
+    let (proxy, proxy_port) = spy();
+    let daemon = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    init_on_port(home.path(), daemon.local_addr().unwrap().port());
+    let t = std::thread::spawn(move || {
+        let (mut s, _) = daemon.accept().unwrap();
+        let mut b = [0u8; 1024];
+        let _ = s.read(&mut b).unwrap();
+        s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let o = run_with_proxies(
+        home.path(),
+        &format!("http://127.0.0.1:{proxy_port}"),
+        &["status"],
+    );
+    assert!(out(&o).contains("daemon:     running"), "{}", out(&o));
+    t.join().unwrap();
+    assert!(untouched(&proxy), "proxy was contacted");
+}
+
+#[test]
+fn status_does_not_follow_redirects() {
+    use std::io::{Read, Write};
+    let home = tempfile::tempdir().unwrap();
+    let (target, target_port) = spy();
+    let daemon = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    init_on_port(home.path(), daemon.local_addr().unwrap().port());
+    let t = std::thread::spawn(move || {
+        let (mut s, _) = daemon.accept().unwrap();
+        let mut b = [0u8; 1024];
+        let _ = s.read(&mut b).unwrap();
+        let r = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target_port}/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        s.write_all(r.as_bytes()).unwrap();
+    });
+    let o = run_in(home.path(), &["status"]);
+    assert!(out(&o).contains("daemon:     not running"), "{}", out(&o));
+    t.join().unwrap();
+    assert!(untouched(&target), "redirect was followed");
+}
