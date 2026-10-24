@@ -1,6 +1,6 @@
 # Tacita — design
 
-Date: 2026-10-24 · Status: draft for owner review · License: Apache-2.0 (already in the repo)
+Date: 2026-10-24 · Status: approved by the owner on 2026-10-24 · License: Apache-2.0 (already in the repo)
 
 Supporting research (sources, recipes, full test list):
 - `docs/research/2026-10-24-prior-art.md`, the landscape, reuse map, detection, restoring rules (R1–R22) and tests (T1–T26), plus the leak checklist
