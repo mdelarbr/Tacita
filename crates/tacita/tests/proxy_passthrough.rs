@@ -314,27 +314,26 @@ async fn sec_fetch_mode_alone_is_allowed() {
 
 #[tokio::test]
 async fn redirects_are_not_followed() {
-    let up = FakeUpstream::start(vec![Reply::status(
-        307,
-        &[("location", "http://127.0.0.1:1/x")],
-        "",
-    )])
-    .await;
-    let or = FakeUpstream::start(vec![]).await;
-    let t = start_off(&up, &or).await;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let resp = client
-        .post(format!("{}/v1/messages", t.base))
-        .body(MIN_BODY)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 307);
-    assert_eq!(resp.headers()["location"], "http://127.0.0.1:1/x");
-    assert_eq!(up.count(), 1);
+    // Even unprotected: Claude Code's fetch would follow a passed-on
+    // redirect and resend the body and the bearer to wherever it points.
+    // The client here follows redirects too.
+    for code in [301u16, 302, 303, 307, 308] {
+        let (up, elsewhere) = redirecting(code).await;
+        let or = FakeUpstream::start(vec![]).await;
+        let t = start_off(&up, &or).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", t.base))
+            .header("authorization", "Bearer sk-ant-oat01-TESTTOKEN")
+            .body(MIN_BODY)
+            .send()
+            .await
+            .unwrap();
+        redirect_refused(resp).await;
+        assert_eq!((up.count(), elsewhere.count()), (1, 0), "{code}");
+        let m = &meta_lines(&t, 1).await[0];
+        assert_eq!(m["status"], 502, "{code}");
+        assert_eq!(m["tacita_error"], REDIRECT_REFUSED);
+    }
 }
 
 #[tokio::test]

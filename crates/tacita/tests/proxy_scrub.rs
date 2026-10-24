@@ -818,6 +818,20 @@ async fn error_bodies_not_restored() {
 }
 
 #[tokio::test]
+async fn redirects_are_refused_in_pairs_mode() {
+    // `post` follows redirects, as Claude Code's fetch does: a passed-on
+    // 307 would resend the original, unscrubbed body.
+    let (up, elsewhere) = redirecting(307).await;
+    let t = start_pairs(&up, Timing::default()).await;
+    let resp = post(&t, FIXTURE).await;
+    redirect_refused(resp).await;
+    assert_eq!((up.count(), elsewhere.count()), (1, 0));
+    let m = &meta_lines(&t, 1).await[0];
+    assert_eq!(m["status"], 502);
+    assert_eq!(m["tacita_error"], REDIRECT_REFUSED);
+}
+
+#[tokio::test]
 async fn unreadable_request_is_refused_without_quoting_it() {
     let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
     let t = start_pairs(&up, Timing::default()).await;

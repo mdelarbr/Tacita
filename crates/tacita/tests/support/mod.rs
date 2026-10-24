@@ -282,6 +282,33 @@ pub async fn tacita_error(resp: reqwest::Response, status: u16) -> String {
     msg
 }
 
+pub const REDIRECT_REFUSED: &str = "upstream answered with a redirect; refusing to pass it on";
+
+/// An upstream that answers every request with a `code` redirect to
+/// `elsewhere`, and the spy it points at.
+pub async fn redirecting(code: u16) -> (FakeUpstream, FakeUpstream) {
+    let elsewhere = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
+    let location = format!("{}/v1/messages", elsewhere.url);
+    let up = FakeUpstream::start(vec![Reply::status(code, &[("location", &location)], "")]).await;
+    (up, elsewhere)
+}
+
+/// Asserts Tacita's no-retry 502 for an upstream redirect, with no
+/// `location` header.
+pub async fn redirect_refused(resp: reqwest::Response) {
+    // `url()` is where a client that followed the redirect ended up.
+    assert_eq!(resp.status(), 502, "answered from {}", resp.url());
+    assert_eq!(
+        resp.headers()
+            .get("x-should-retry")
+            .map(|v| v.to_str().unwrap()),
+        Some("false")
+    );
+    assert!(resp.headers().get("location").is_none());
+    let msg = tacita_error(resp, 502).await;
+    assert_eq!(msg, format!("Tacita: {REDIRECT_REFUSED}"));
+}
+
 /// `event: <name>\ndata: <compact json>\n\n` for each event.
 pub fn sse(events: &[(&str, Value)]) -> Vec<u8> {
     let mut out = Vec::new();

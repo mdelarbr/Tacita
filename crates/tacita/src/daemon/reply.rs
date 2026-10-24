@@ -1,5 +1,6 @@
 //! The reply in a protected mode: a 2xx is restored or refused, never passed
-//! on as it came; any other status is passed on verbatim.
+//! on as it came; any other status but a redirect is passed on verbatim.
+//! A redirect is refused in every mode.
 
 use axum::body::Body;
 use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE};
@@ -43,7 +44,8 @@ fn is_identity(headers: &HeaderMap) -> bool {
 }
 
 /// The reply in a protected mode. A 2xx is restored or refused with a 502,
-/// never passed on as it came; any other status is passed on verbatim.
+/// never passed on as it came; any other status is passed on verbatim (the
+/// caller has already refused a redirect).
 pub(super) async fn protected_reply(
     app: &App,
     upstream: reqwest::Response,
@@ -110,6 +112,16 @@ fn no_retry(m: MetaHandle, message: &str) -> Response {
     resp.headers_mut()
         .insert("x-should-retry", HeaderValue::from_static("false"));
     resp
+}
+
+/// Any upstream 3xx, in every mode and for both providers. Claude Code's
+/// fetch would follow a passed-on redirect and resend the original body,
+/// unscrubbed and with its credentials, to wherever it points.
+pub(super) fn redirect_refused(m: MetaHandle) -> Response {
+    no_retry(
+        m,
+        "upstream answered with a redirect; refusing to pass it on",
+    )
 }
 
 fn unrestorable(m: MetaHandle, reason: &str) -> Response {

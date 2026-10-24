@@ -359,6 +359,7 @@ async fn messages(
         .send()
         .await;
     match sent {
+        Ok(upstream) if upstream.status().is_redirection() => reply::redirect_refused(m),
         Ok(upstream) if protected => reply::protected_reply(app, upstream, m).await,
         Ok(upstream) => pass_through(upstream, m),
         Err(e) => {
@@ -458,6 +459,7 @@ async fn openrouter(
         .send()
         .await
     {
+        Ok(upstream) if upstream.status().is_redirection() => reply::redirect_refused(m),
         Ok(upstream) => reply::protected_reply(app, upstream, m).await,
         Err(e) => {
             let message = format!("cannot reach OpenRouter: {}", short_reason(&e));

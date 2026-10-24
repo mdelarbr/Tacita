@@ -328,6 +328,28 @@ async fn upstream_errors_pass_verbatim() {
 }
 
 #[tokio::test]
+async fn redirects_from_openrouter_are_refused() {
+    // `post` follows redirects, as Claude Code's fetch does: a passed-on
+    // 307 would resend the original body and the Anthropic bearer.
+    let anthropic = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
+    let (or, elsewhere) = redirecting(307).await;
+    let t = start_tacita(
+        CONFIG_PAIRS,
+        Some(STATE),
+        &anthropic,
+        &or,
+        store(Some(KEY)),
+        Timing::default(),
+    )
+    .await;
+    redirect_refused(post(&t, simple("hi acmewidgets")).await).await;
+    assert_eq!((or.count(), elsewhere.count(), anthropic.count()), (1, 0, 0));
+    let m = &meta_lines(&t, 1).await[0];
+    assert_eq!(m["status"], 502);
+    assert_eq!(m["tacita_error"], REDIRECT_REFUSED);
+}
+
+#[tokio::test]
 async fn meta_line_names_models_and_never_holds_the_key() {
     let r = rig(Some(STATE), Some(KEY), vec![Reply::Echo]).await;
     let resp = post(&r.t, simple("hi")).await;
