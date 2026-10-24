@@ -134,7 +134,7 @@ async fn openrouter_body_adapted_and_scrubbed() {
 }
 
 #[tokio::test]
-async fn anthropic_upstream_untouched_in_openrouter_mode() {
+async fn anthropic_mode_unchanged_with_a_key_stored() {
     let r = rig(None, Some(KEY), vec![Reply::Echo]).await;
     let resp = post(&r.t, simple("hello")).await;
     assert_eq!(resp.status(), 200);
@@ -167,7 +167,9 @@ async fn missing_model_is_a_visible_error() {
         vec![Reply::Echo],
     )
     .await;
-    let msg = tacita_error(post(&r.t, simple("hi")).await, 500).await;
+    let resp = post(&r.t, simple("hi")).await;
+    assert_eq!(resp.headers()["x-should-retry"], "false");
+    let msg = tacita_error(resp, 500).await;
     assert!(msg.contains("tacita use openrouter --model"), "{msg}");
     assert_eq!((r.or.count(), r.anthropic.count()), (0, 0));
 }
@@ -238,16 +240,72 @@ async fn names_restored_from_openrouter_stream() {
     assert!(!text.contains("client_x01") && !text.contains("person_x01"));
 }
 
+const COMMENT: &str = ": OPENROUTER PROCESSING\n\n";
+
 #[tokio::test]
 async fn processing_comments_pass_between_events() {
-    let mut sse_body = b": OPENROUTER PROCESSING\n\n".to_vec();
+    let mut sse_body = COMMENT.as_bytes().to_vec();
     sse_body.extend(stop_only());
     let r = rig(Some(STATE), Some(KEY), vec![Reply::sse(sse_body)]).await;
     let resp = post(&r.t, simple("hi")).await;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
-    assert!(text.contains(": OPENROUTER PROCESSING"), "{text}");
+    assert!(text.contains(COMMENT), "{text}");
     assert!(text.contains("event: message_stop"), "{text}");
+}
+
+#[tokio::test]
+async fn processing_comments_pass_while_a_tool_block_is_held() {
+    let ev = |name, data: Value| sse(&[(name, data)]);
+    let delta = |part: &str| {
+        ev(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}}),
+        )
+    };
+    let mut body = ev(
+        "message_start",
+        json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":1}}}),
+    );
+    body.extend(COMMENT.as_bytes());
+    body.extend(ev(
+        "content_block_start",
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_0","name":"Read","input":{}}}),
+    ));
+    body.extend(COMMENT.as_bytes());
+    body.extend(delta("{\"file_path\":\"/x/client"));
+    body.extend(COMMENT.as_bytes());
+    body.extend(delta("_x01/a\"}"));
+    body.extend(ev(
+        "content_block_stop",
+        json!({"type":"content_block_stop","index":0}),
+    ));
+    body.extend(ev(
+        "message_delta",
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}),
+    ));
+    body.extend(stop_only());
+    let r = rig(Some(STATE), Some(KEY), vec![Reply::sse(body)]).await;
+    let resp = post(&r.t, simple("hi")).await;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert_eq!(text.matches(COMMENT).count(), 3, "{text}");
+    let deltas: Vec<&str> = text
+        .split("\n\n")
+        .filter(|b| b.contains("input_json_delta"))
+        .collect();
+    assert_eq!(deltas.len(), 1, "{text}");
+    assert!(deltas[0].contains("/x/acmewidgets/a"), "{}", deltas[0]);
+    assert!(!text.contains("client_x01"), "{text}");
+}
+
+#[tokio::test]
+async fn missing_key_is_reported_before_an_unknown_model() {
+    let r = rig(Some(STATE), None, vec![Reply::Echo]).await;
+    let body = simple("hi").replace("claude-opus-5-5", "gpt-4o");
+    let msg = tacita_error(post(&r.t, body).await, 400).await;
+    assert!(msg.contains("no OpenRouter key"), "{msg}");
+    assert_eq!(r.or.count(), 0);
 }
 
 #[tokio::test]
@@ -292,10 +350,22 @@ async fn meta_line_names_models_and_never_holds_the_key() {
 #[ignore]
 fn keychain_round_trip() {
     use tacita::secrets::KeychainStore;
+    /// Deletes the test item even if an assertion panics.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = security_framework::passwords::delete_generic_password(
+                "dev.tacita.test",
+                "openrouter",
+            );
+        }
+    }
+    let _cleanup = Cleanup;
     let s = KeychainStore::new("dev.tacita.test");
     assert_eq!(s.get("openrouter").unwrap(), None);
     s.set("openrouter", "sk-or-v1-ROUNDTRIP").unwrap();
-    let got = s.get("openrouter").unwrap();
-    let _ = security_framework::passwords::delete_generic_password("dev.tacita.test", "openrouter");
-    assert_eq!(got.as_deref(), Some("sk-or-v1-ROUNDTRIP"));
+    assert_eq!(
+        s.get("openrouter").unwrap().as_deref(),
+        Some("sk-or-v1-ROUNDTRIP")
+    );
 }

@@ -63,7 +63,7 @@ fn check_openrouter_key(input: &str) -> Result<&str, String> {
         return Err("no key entered".into());
     }
     if !key.starts_with("sk-or-") || !key.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err("that does not look like an OpenRouter key (sk-or-...)".into());
+        return Err("that does not look like an OpenRouter key (sk-or-…)".into());
     }
     Ok(key)
 }

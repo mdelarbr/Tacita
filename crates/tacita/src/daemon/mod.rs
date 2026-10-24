@@ -250,10 +250,13 @@ async fn messages(
     let state = match config::State::load(&app.opts.home) {
         Ok(s) => s,
         Err(e) => {
-            return m.fail(
+            let mut resp = m.fail(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("cannot read state.toml: {e}"),
             );
+            resp.headers_mut()
+                .insert("x-should-retry", HeaderValue::from_static("false"));
+            return resp;
         }
     };
     let (provider, protection) = match state.provider {
@@ -265,22 +268,16 @@ async fn messages(
         Protection::Off => "off",
         Protection::Pairs => "pairs",
     });
-    if state.provider == Provider::Openrouter {
-        return openrouter(app, m, headers, body, &state).await;
+    match state.provider {
+        Provider::Openrouter => return openrouter(app, m, headers, body, &state).await,
+        Provider::Anthropic => {}
     }
     m.meta.model_out = m.meta.model_in.clone();
     let protected = protection != Protection::Off;
     let body = if protected {
-        match scrub_request(&body, &app.pairs) {
-            Ok(s) => {
-                m.meta.scrubbed = Some(s.replacements);
-                m.meta.scrubbed_system = Some(s.in_system);
-                s.body
-            }
-            Err(e) => {
-                let message = format!("could not read this request: {}", bounded(&e.to_string()));
-                return m.fail(StatusCode::BAD_REQUEST, &message);
-            }
+        match scrub(app, &mut m, &body) {
+            Ok(b) => b,
+            Err(resp) => return *resp,
         }
     } else {
         body
@@ -311,6 +308,23 @@ async fn messages(
     }
 }
 
+/// Scrubs the body and records the counts; `Err` is the 400 to return.
+fn scrub(app: &App, m: &mut MetaHandle, body: &[u8]) -> Result<Vec<u8>, Box<Response>> {
+    match scrub_request(body, &app.pairs) {
+        Ok(s) => {
+            m.meta.scrubbed = Some(s.replacements);
+            m.meta.scrubbed_system = Some(s.in_system);
+            Ok(s.body)
+        }
+        Err(e) => {
+            let message = format!("could not read this request: {}", bounded(&e.to_string()));
+            m.meta.status = StatusCode::BAD_REQUEST.as_u16();
+            m.meta.tacita_error = Some(message.clone());
+            Err(Box::new(tacita_error(StatusCode::BAD_REQUEST, &message)))
+        }
+    }
+}
+
 /// The OpenRouter route: model, key, scrub, adapt, then the same protected
 /// reply as the Anthropic path. Nothing is forwarded on any error, and only
 /// `openrouter_headers` and the adapted body reach OpenRouter.
@@ -327,20 +341,28 @@ async fn openrouter(
             "no OpenRouter model: run `tacita use openrouter --model <slug>`",
         );
     };
-    let key = match app.opts.secrets.get("openrouter") {
-        Ok(Some(k)) => k,
-        Ok(None) => {
+    // The Keychain may show a dialog; keep it off the async workers.
+    let secrets = app.opts.secrets.clone();
+    let key = match tokio::task::spawn_blocking(move || secrets.get("openrouter")).await {
+        Ok(Ok(Some(k))) => k,
+        Ok(Ok(None)) => {
             return m.fail(
                 StatusCode::BAD_REQUEST,
                 "no OpenRouter key: run `tacita key set openrouter`",
             );
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let message = format!(
                 "cannot read the OpenRouter key from the Keychain: {}",
                 bounded(&e.to_string())
             );
             return m.fail(StatusCode::BAD_REQUEST, &message);
+        }
+        Err(_) => {
+            return m.fail(
+                StatusCode::BAD_REQUEST,
+                "cannot read the OpenRouter key from the Keychain: the read did not finish",
+            );
         }
     };
     let Some(out_headers) = forward::openrouter_headers(headers, &key) else {
@@ -349,19 +371,14 @@ async fn openrouter(
             "the stored OpenRouter key is not usable; run `tacita key set openrouter` again",
         );
     };
-    let scrubbed = match scrub_request(&body, &app.pairs) {
-        Ok(s) => s,
-        Err(e) => {
-            let message = format!("could not read this request: {}", bounded(&e.to_string()));
-            return m.fail(StatusCode::BAD_REQUEST, &message);
-        }
+    let scrubbed = match scrub(app, &mut m, &body) {
+        Ok(b) => b,
+        Err(resp) => return *resp,
     };
-    m.meta.scrubbed = Some(scrubbed.replacements);
-    m.meta.scrubbed_system = Some(scrubbed.in_system);
     let prefs = Prefs {
         only: app.config.openrouter.only.clone(),
     };
-    let body = match adapt_request(&scrubbed.body, slug, &prefs) {
+    let body = match adapt_request(&scrubbed, slug, &prefs) {
         Ok(b) => b,
         Err(e) => return m.fail(StatusCode::BAD_REQUEST, bounded(&e.to_string())),
     };

@@ -367,3 +367,16 @@ fn daemon_prints_no_banner_when_startup_fails() {
         err(&o)
     );
 }
+
+#[test]
+fn key_set_accepts_only_openrouter() {
+    let home = tempfile::tempdir().unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_tacita"))
+        .env("TACITA_HOME", home.path())
+        .args(["key", "set", "anthropic"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("input hidden"));
+}
