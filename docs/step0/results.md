@@ -24,7 +24,7 @@ Fill in during the run (see `runbook.md`). Write PASS, FAIL or n/a, and a note f
 | Criterion | Result | Notes |
 | --- | --- | --- |
 | `/status`: Max login row, Tacita base URL, no "Auth token" / "API key" row | | |
-| Every `/v1/messages` line has status 200 (count_tokens 404 expected) | | |
+| Every `/v1/messages` line other than the block-probe line has status 200 (count_tokens 404 expected) | | |
 | `ratelimit` headers present, `unified-status` allowed | | |
 | `5h-utilization` rises | | |
 | No overage; claude.ai shows plan usage, not extra usage | | |
@@ -41,7 +41,10 @@ First turn (`acmewidgets: read README.md and summarize it`), on its own line:
 
 | Criterion | Result | Notes |
 | --- | --- | --- |
-| Same as test 1 (200, allowed, 5h rises, no overage) | | |
+| Every `/v1/messages` line has status 200 (count_tokens 404 expected; stream-probe turn excepted) | | |
+| `ratelimit` headers present, `unified-status` allowed | | |
+| `5h-utilization` rises | | |
+| No overage; claude.ai shows plan usage, not extra usage | | |
 | `scrubbed_system > 0` on the main model's requests | | |
 | No 400 "Third-party apps now draw from your extra usage" | | |
 | No 429 without `unified` headers | | |
@@ -67,7 +70,7 @@ Pre-flight:
 | Step | Result | Notes |
 | --- | --- | --- |
 | Own identifiers added to `step0.pairs` | | |
-| One Anthropic prompt recorded; newest `-forwarded.json` has none of them | | |
+| One Anthropic prompt recorded (own record_dir); `grep -lF` over the whole newest run printed nothing; pre-check folder deleted | | |
 | Session started with `ENABLE_CLAUDEAI_MCP_SERVERS=false` | | |
 | Only harmless Bash commands used | | |
 
@@ -117,6 +120,7 @@ Fallback (Claude models via OpenRouter) tried:
 | `/compact` | | |
 | Thinking turn | | |
 | Secret grep (`sk-ant-`, `sk-or-`, `ghp_`, `AKIA`, `-----BEGIN`, `Bearer `) found nothing, or hits fixed / deleted | | |
+| Identifier grep (`-F`, test-3 pairs): no hits in `-forwarded.json` / `-client.txt`; hits fixed / deleted | | |
 | Corpus kept outside the repo, not committed | | |
 
 ## Decisions

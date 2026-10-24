@@ -14,8 +14,8 @@ case "$tacita" in
   *) echo "make-throwaway-repo: the tacita path must be absolute: $tacita" >&2; exit 1 ;;
 esac
 case "$tacita" in
-  *[\"\\]* | *$'\n'*)
-    echo "make-throwaway-repo: the tacita path must not contain quotes, backslashes or newlines" >&2
+  *[\"\\$\`]* | *$'\n'* | *$'\t'*)
+    echo "make-throwaway-repo: the tacita path must not contain quotes, backslashes, \$, backticks, tabs or newlines" >&2
     exit 1 ;;
 esac
 if [ ! -x "$tacita" ]; then
