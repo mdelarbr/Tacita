@@ -612,15 +612,6 @@ async fn bad_state_is_a_visible_500() {
 async fn unbuilt_modes_are_refused_visibly() {
     let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
     let or = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
-    let pairs = start_tacita(
-        CONFIG_PAIRS,
-        None,
-        &up,
-        &or,
-        Default::default(),
-        Timing::default(),
-    )
-    .await;
     let openrouter = start_tacita(
         CONFIG_OFF,
         Some("provider = \"openrouter\"\nopenrouter_model = \"qwen/qwen3-coder\"\n"),
@@ -630,23 +621,16 @@ async fn unbuilt_modes_are_refused_visibly() {
         Timing::default(),
     )
     .await;
-    for t in [&pairs, &openrouter] {
-        let resp = reqwest::Client::new()
-            .post(format!("{}/v1/messages", t.base))
-            .body(MIN_BODY)
-            .send()
-            .await
-            .unwrap();
-        let msg = tacita_error(resp, 400).await;
-        assert_eq!(msg, "Tacita: this mode is not built yet");
-    }
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", openrouter.base))
+        .body(MIN_BODY)
+        .send()
+        .await
+        .unwrap();
+    let msg = tacita_error(resp, 400).await;
+    assert_eq!(msg, "Tacita: this mode is not built yet");
     assert_eq!(up.count(), 0);
     assert_eq!(or.count(), 0);
-    let p = &meta_lines(&pairs, 1).await[0];
-    assert_eq!(
-        (&p["provider"], &p["protection"]),
-        (&json!("anthropic"), &json!("pairs"))
-    );
     let o = &meta_lines(&openrouter, 1).await[0];
     assert_eq!(
         (&o["provider"], &o["protection"]),

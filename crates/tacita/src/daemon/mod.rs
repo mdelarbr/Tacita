@@ -3,6 +3,7 @@
 pub mod forward;
 pub mod metalog;
 pub mod route;
+mod stream;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -14,12 +15,15 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::serve::ListenerExt;
 use futures_util::StreamExt;
 use tacita_core::errors::error_body;
+use tacita_core::pairs::Pairs;
+use tacita_core::request::scrub_request;
+use tacita_core::restore::{Limits, Restorer, restore_message};
 
 use crate::config::{self, Config, Protection, Provider};
 use crate::secrets::SecretStore;
@@ -32,6 +36,12 @@ const OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api";
 
 /// Largest request body read.
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// Largest non-streamed reply read for restoring.
+const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
+/// Longest reason put into a Tacita error or `tacita_error`.
+const MAX_REASON_BYTES: usize = 200;
+
+const BLOCK_PROBE: &str = "block probe: this request was blocked on purpose (Step 0)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
@@ -79,6 +89,8 @@ struct App {
     /// `host[:port]` of the Anthropic upstream, for error messages.
     anthropic_host: String,
     client: reqwest::Client,
+    /// The Step 0 dictionary, built once from `config`.
+    pairs: Arc<Pairs>,
     log: Arc<MetaLog>,
     next: AtomicU64,
 }
@@ -106,9 +118,11 @@ impl Server {
         );
         let config = Config::load(&opts.home)?;
         let anthropic_host = host_label(&opts.anthropic_upstream)?;
+        let pairs = config.pairs()?;
         let log = MetaLog::open(&opts.home).context("cannot open logs/requests.jsonl")?;
         let app = Arc::new(App {
             client: forward::client(&opts.timing),
+            pairs,
             opts,
             config,
             port: addr.port(),
@@ -227,6 +241,13 @@ async fn messages(
         }
     };
     m.meta.peek_request(&body);
+    if let Some(probe) = app.config.step0.block_probe.as_deref()
+        && contains(&body, probe.as_bytes())
+    {
+        m.meta.status = StatusCode::BAD_REQUEST.as_u16();
+        m.meta.tacita_error = Some("block probe".to_string());
+        return tacita_error(StatusCode::BAD_REQUEST, BLOCK_PROBE);
+    }
     let state = match config::State::load(&app.opts.home) {
         Ok(s) => s,
         Err(e) => {
@@ -245,10 +266,26 @@ async fn messages(
         Protection::Off => "off",
         Protection::Pairs => "pairs",
     });
-    if state.provider != Provider::Anthropic || protection != Protection::Off {
+    if state.provider != Provider::Anthropic {
         return m.fail(StatusCode::BAD_REQUEST, "this mode is not built yet");
     }
     m.meta.model_out = m.meta.model_in.clone();
+    let protected = protection != Protection::Off;
+    let body = if protected {
+        match scrub_request(&body, &app.pairs) {
+            Ok(s) => {
+                m.meta.scrubbed = Some(s.replacements);
+                m.meta.scrubbed_system = Some(s.in_system);
+                s.body
+            }
+            Err(e) => {
+                let message = format!("could not read this request: {}", bounded(&e.to_string()));
+                return m.fail(StatusCode::BAD_REQUEST, &message);
+            }
+        }
+    } else {
+        body
+    };
     // Only the fixed path and the incoming query reach the upstream URL.
     let mut url = format!(
         "{}/v1/messages",
@@ -261,11 +298,12 @@ async fn messages(
     let sent = app
         .client
         .post(url)
-        .headers(forward::anthropic_headers(headers, false))
+        .headers(forward::anthropic_headers(headers, protected))
         .body(body)
         .send()
         .await;
     match sent {
+        Ok(upstream) if protected => protected_reply(app, upstream, m).await,
         Ok(upstream) => pass_through(upstream, m),
         Err(e) => {
             let message = format!("cannot reach {}: {}", app.anthropic_host, short_reason(&e));
@@ -322,6 +360,114 @@ fn short_reason(e: &reqwest::Error) -> String {
     }
 }
 
+/// The first `MAX_REASON_BYTES` of `reason`, cut at a char boundary.
+fn bounded(reason: &str) -> &str {
+    let mut end = reason.len().min(MAX_REASON_BYTES);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
+/// An empty needle matches nothing.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+enum Media {
+    EventStream,
+    Json,
+}
+
+/// The one `content-type`, by type/subtype before any parameter.
+fn media_type(headers: &HeaderMap) -> Option<Media> {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let essence = value.to_str().ok()?.split(';').next()?.trim();
+    if essence.eq_ignore_ascii_case("text/event-stream") {
+        Some(Media::EventStream)
+    } else if essence.eq_ignore_ascii_case("application/json") {
+        Some(Media::Json)
+    } else {
+        None
+    }
+}
+
+fn is_identity(headers: &HeaderMap) -> bool {
+    headers.get_all(CONTENT_ENCODING).iter().all(|v| {
+        v.to_str()
+            .is_ok_and(|e| e.trim().eq_ignore_ascii_case("identity"))
+    })
+}
+
+/// The reply in a protected mode. A 2xx is restored or refused with a 502,
+/// never passed on as it came; any other status is passed on verbatim.
+async fn protected_reply(app: &App, upstream: reqwest::Response, mut m: MetaHandle) -> Response {
+    let status = upstream.status();
+    if !status.is_success() {
+        return pass_through(upstream, m);
+    }
+    let headers = upstream.headers().clone();
+    m.meta.upstream_response(status, &headers);
+    let identity = is_identity(&headers);
+    let body = match media_type(&headers) {
+        Some(Media::EventStream) if !identity => {
+            return m.fail(
+                StatusCode::BAD_GATEWAY,
+                "compressed stream from upstream; refusing to pass it on unrestored",
+            );
+        }
+        Some(Media::EventStream) => {
+            let restorer = Restorer::new(
+                app.pairs.clone(),
+                Limits::default(),
+                app.config.step0.stream_probe.clone(),
+            );
+            stream::restoring_body(upstream.bytes_stream(), restorer, app.opts.timing, m)
+        }
+        Some(Media::Json) if !identity => return unrestorable(m, "it is compressed"),
+        Some(Media::Json) => {
+            let raw = match read_reply(upstream).await {
+                Ok(raw) => raw,
+                Err(reason) => return unrestorable(m, &reason),
+            };
+            match restore_message(&raw, &app.pairs) {
+                Ok((restored, n)) => {
+                    m.meta.restored = Some(n);
+                    Body::from(restored)
+                }
+                Err(e) => return unrestorable(m, &e.to_string()),
+            }
+        }
+        None => return unrestorable(m, "it is neither an event stream nor JSON"),
+    };
+    let mut resp = Response::new(body);
+    *resp.status_mut() = status;
+    *resp.headers_mut() = forward::response_headers(&headers, true);
+    resp
+}
+
+fn unrestorable(m: MetaHandle, reason: &str) -> Response {
+    let message = format!("could not restore the reply: {}", bounded(reason));
+    m.fail(StatusCode::BAD_GATEWAY, &message)
+}
+
+/// Reads a whole non-streamed reply, up to `MAX_REPLY_BYTES`.
+async fn read_reply(upstream: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut stream = upstream.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("it broke off: {}", short_reason(&e)))?;
+        if out.len() + chunk.len() > MAX_REPLY_BYTES {
+            return Err("it is larger than 64 MiB".to_string());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 /// Status, headers and body bytes go to the client unchanged and unbuffered;
 /// the observer reads them on the side.
 fn pass_through(upstream: reqwest::Response, mut m: MetaHandle) -> Response {
@@ -364,6 +510,25 @@ impl Drop for Side {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_cuts_at_a_char_boundary() {
+        assert_eq!(bounded("short"), "short");
+        let long = "é".repeat(150); // 300 bytes
+        let cut = bounded(&long);
+        assert_eq!(cut.len(), 200);
+        assert_eq!(cut, "é".repeat(100));
+        let odd = format!("a{long}");
+        assert_eq!(bounded(&odd).len(), 199);
+    }
+
+    #[test]
+    fn contains_finds_the_probe_and_never_an_empty_one() {
+        assert!(contains(b"x TACITA_BLOCK_PROBE y", b"TACITA_BLOCK_PROBE"));
+        assert!(!contains(b"x TACITA_BLOCK_PROB", b"TACITA_BLOCK_PROBE"));
+        assert!(!contains(b"anything", b""));
+        assert!(!contains(b"", b"x"));
+    }
 
     #[test]
     fn default_timing() {
