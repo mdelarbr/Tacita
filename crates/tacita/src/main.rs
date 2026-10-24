@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tacita::config::{Config, ConfigError, Protection, Provider, State};
+use tacita::daemon::{DaemonOptions, serve};
 use tacita::paths;
 
 #[derive(Parser)]
@@ -27,6 +28,8 @@ enum Cmd {
         #[command(subcommand)]
         provider: UseCmd,
     },
+    /// Run the proxy in the foreground on 127.0.0.1 (Ctrl-C stops it)
+    Daemon,
 }
 
 #[derive(Subcommand)]
@@ -105,6 +108,35 @@ async fn print_status(home: &Path, cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Binds 127.0.0.1 only and serves until Ctrl-C.
+async fn run_daemon(home: std::path::PathBuf) -> Result<(), String> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let cfg = load_config(&home)?;
+    let port = cfg.port;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!("port {port} is in use (is another tacita daemon running?)")
+            } else {
+                format!("cannot listen on 127.0.0.1:{port}: {e}")
+            }
+        })?;
+    // Registered before the banner, so a Ctrl-C right after it is caught.
+    let mut interrupt =
+        signal(SignalKind::interrupt()).map_err(|e| format!("cannot catch Ctrl-C: {e}"))?;
+    println!("Tacita listening on {}", cfg.base_url());
+    tokio::select! {
+        served = serve(DaemonOptions::production(home), listener) => {
+            served.map_err(|e| format!("{e:#}"))
+        }
+        _ = interrupt.recv() => {
+            println!("Tacita stopped");
+            Ok(())
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<(), String> {
     let home = paths::home();
     match cli.command {
@@ -148,6 +180,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             state.save(&home).map_err(|e| e.to_string())?;
             print_status(&home, &cfg).await?;
         }
+        Cmd::Daemon => run_daemon(home).await?,
     }
     Ok(())
 }

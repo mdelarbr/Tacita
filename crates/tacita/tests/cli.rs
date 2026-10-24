@@ -226,3 +226,85 @@ fn status_does_not_follow_redirects() {
     t.join().unwrap();
     assert!(untouched(&target), "redirect was followed");
 }
+
+#[test]
+fn daemon_refuses_a_port_in_use() {
+    let home = tempfile::tempdir().unwrap();
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = busy.local_addr().unwrap().port();
+    init_on_port(home.path(), port);
+    let o = run_in(home.path(), &["daemon"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o),
+        format!("tacita: port {port} is in use (is another tacita daemon running?)\n")
+    );
+    assert_eq!(out(&o), "");
+}
+
+/// Kills the child if the test fails before it exits.
+struct Daemon(std::process::Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn daemon_listens_answers_hello_and_stops_on_ctrl_c() {
+    use std::io::{BufRead, Read};
+    use std::time::{Duration, Instant};
+    let home = tempfile::tempdir().unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    init_on_port(home.path(), port);
+    let base = out(&run_in(home.path(), &["status", "--base-url"]));
+    let mut d = Daemon(
+        std::process::Command::new(env!("CARGO_BIN_EXE_tacita"))
+            .arg("daemon")
+            .env("TACITA_HOME", home.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = std::io::BufReader::new(d.0.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, format!("Tacita listening on {base}"));
+    assert!(out(&run_in(home.path(), &["status"])).contains("daemon:     running"));
+    let killed = std::process::Command::new("kill")
+        .args(["-INT", &d.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = d.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "daemon did not stop on SIGINT");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "Tacita stopped\n");
+    let mut stderr = String::new();
+    d.0.stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("/api/hello"), "{stderr}");
+    assert!(
+        !stderr.contains(base.trim().rsplit('/').next().unwrap()),
+        "{stderr}"
+    );
+    let log = std::fs::read_to_string(home.path().join("logs/requests.jsonl")).unwrap();
+    assert!(log.contains(r#""route":"hello""#), "{log}");
+}
