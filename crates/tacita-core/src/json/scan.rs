@@ -6,6 +6,10 @@ use thiserror::Error;
 
 /// Maximum nesting depth accepted by the scanner.
 const MAX_DEPTH: usize = 512;
+/// Budget for the total path material cloned into the returned `Lit`s, in
+/// bytes: per recorded literal, `path.len() * size_of::<Seg>()` plus the byte
+/// length of every key in its path.
+const MAX_PATH_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seg {
@@ -33,6 +37,11 @@ struct Scanner<'a> {
     pos: usize,
     path: Vec<Seg>,
     out: Vec<Lit>,
+    /// Path material of the current `path`.
+    cur_cost: usize,
+    /// Sum of `cur_cost` over recorded literals.
+    spent: usize,
+    budget: usize,
 }
 
 type Res<T> = Result<T, ScanError>;
@@ -43,6 +52,40 @@ impl<'a> Scanner<'a> {
             offset: self.pos,
             reason,
         })
+    }
+
+    fn seg_cost(seg: &Seg) -> usize {
+        std::mem::size_of::<Seg>()
+            + match seg {
+                Seg::Key(k) => k.len(),
+                Seg::Index(_) => 0,
+            }
+    }
+
+    fn push_seg(&mut self, seg: Seg) {
+        self.cur_cost += Self::seg_cost(&seg);
+        self.path.push(seg);
+    }
+
+    fn pop_seg(&mut self) {
+        if let Some(seg) = self.path.pop() {
+            self.cur_cost -= Self::seg_cost(&seg);
+        }
+    }
+
+    /// Records a literal at the current path, enforcing the path budget
+    /// before the path is cloned.
+    fn record(&mut self, span: Range<usize>, is_key: bool) -> Res<()> {
+        match self.spent.checked_add(self.cur_cost) {
+            Some(total) if total <= self.budget => self.spent = total,
+            _ => return self.err("too complex"),
+        }
+        self.out.push(Lit {
+            span,
+            path: self.path.clone(),
+            is_key,
+        });
+        Ok(())
     }
 
     fn ws(&mut self) {
@@ -159,12 +202,7 @@ impl<'a> Scanner<'a> {
             None => self.err("unexpected end of input"),
             Some(b'"') => {
                 let span = self.string()?;
-                self.out.push(Lit {
-                    span,
-                    path: self.path.clone(),
-                    is_key: false,
-                });
-                Ok(())
+                self.record(span, false)
             }
             Some(b'{') => {
                 if depth >= MAX_DEPTH {
@@ -185,16 +223,12 @@ impl<'a> Scanner<'a> {
                     let Ok(key) = decode(&self.b[span.clone()]) else {
                         return self.err("invalid key");
                     };
-                    self.path.push(Seg::Key(key.text));
-                    self.out.push(Lit {
-                        span,
-                        path: self.path.clone(),
-                        is_key: true,
-                    });
+                    self.push_seg(Seg::Key(key.text));
+                    self.record(span, true)?;
                     self.ws();
                     self.eat(b':', "expected ':'")?;
                     self.value(depth + 1)?;
-                    self.path.pop();
+                    self.pop_seg();
                     self.ws();
                     match self.b.get(self.pos) {
                         Some(b',') => self.pos += 1,
@@ -218,9 +252,9 @@ impl<'a> Scanner<'a> {
                 }
                 let mut idx = 0;
                 loop {
-                    self.path.push(Seg::Index(idx));
+                    self.push_seg(Seg::Index(idx));
                     self.value(depth + 1)?;
-                    self.path.pop();
+                    self.pop_seg();
                     idx += 1;
                     self.ws();
                     match self.b.get(self.pos) {
@@ -242,12 +276,15 @@ impl<'a> Scanner<'a> {
     }
 }
 
-fn run(json: &[u8]) -> (Vec<Lit>, Res<()>) {
+fn run(json: &[u8], budget: usize) -> (Vec<Lit>, Res<()>) {
     let mut s = Scanner {
         b: json,
         pos: 0,
         path: Vec::new(),
         out: Vec::new(),
+        cur_cost: 0,
+        spent: 0,
+        budget,
     };
     let r = s.value(0).and_then(|()| {
         s.ws();
@@ -262,13 +299,13 @@ fn run(json: &[u8]) -> (Vec<Lit>, Res<()>) {
 
 /// Strict scan: the input must be exactly one JSON value plus whitespace.
 pub fn scan(json: &[u8]) -> Result<Vec<Lit>, ScanError> {
-    let (out, r) = run(json);
+    let (out, r) = run(json, MAX_PATH_BYTES);
     r.map(|()| out)
 }
 
 /// Returns every complete literal before the first error or the end of input.
 pub fn scan_tolerant(json: &[u8]) -> Vec<Lit> {
-    run(json).0
+    run(json, MAX_PATH_BYTES).0
 }
 
 /// Applies sorted, non-overlapping edits to `src`.
@@ -276,6 +313,9 @@ pub fn splice(src: &[u8], edits: Vec<(Range<usize>, Vec<u8>)>) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len());
     let mut at = 0;
     for (r, rep) in edits {
+        debug_assert!(r.start <= r.end, "inverted edit range");
+        debug_assert!(r.start >= at, "edits unsorted or overlapping");
+        debug_assert!(r.end <= src.len(), "edit out of bounds");
         out.extend_from_slice(&src[at..r.start]);
         out.extend_from_slice(&rep);
         at = r.end;
@@ -419,15 +459,83 @@ mod tests {
         }
 
         #[test]
-        fn tolerant_never_panics_on_prefixes(v in arb_value(), cut in 0.0f64..=1.0) {
+        fn tolerant_prefix_is_prefix_of_full_scan(v in arb_value()) {
             let bytes = serde_json::to_vec(&v).unwrap();
-            let n = (bytes.len() as f64 * cut) as usize;
-            let _ = scan_tolerant(&bytes[..n]);
+            let full = scan(&bytes).unwrap();
+            for n in 0..=bytes.len() {
+                let part = scan_tolerant(&bytes[..n]);
+                prop_assert!(part.len() <= full.len());
+                for (a, b) in part.iter().zip(&full) {
+                    prop_assert_eq!(&a.span, &b.span);
+                    prop_assert_eq!(&a.path, &b.path);
+                    prop_assert_eq!(a.is_key, b.is_key);
+                }
+            }
         }
 
         #[test]
         fn tolerant_never_panics_on_arbitrary_bytes(b in prop::collection::vec(any::<u8>(), 0..256)) {
             let _ = scan_tolerant(&b);
         }
+    }
+
+    #[test]
+    fn path_budget_trips_on_hostile_input() {
+        // 300 nested keys around a flat array of strings: each literal carries
+        // a 300-deep path, so the total grows as literals x depth.
+        let mut j = Vec::new();
+        for _ in 0..300 {
+            j.extend_from_slice(b"{\"k\":");
+        }
+        j.push(b'[');
+        for _ in 0..2000 {
+            j.extend_from_slice(b"\"a\",");
+        }
+        j.extend_from_slice(b"\"a\"]");
+        j.extend(std::iter::repeat_n(b'}', 300));
+        let budget = 1024 * 1024;
+        let (out, r) = run(&j, budget);
+        assert_eq!(r.unwrap_err().reason, "too complex");
+        let spent: usize = out
+            .iter()
+            .map(|l| l.path.iter().map(Scanner::seg_cost).sum::<usize>())
+            .sum();
+        assert!(spent <= budget);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn path_budget_counts_key_bytes() {
+        let key = "x".repeat(10_000);
+        let j = format!("[{}]", format!("{{\"{key}\":\"v\"}},").repeat(50) + "1");
+        // Each literal costs >= 10_000 bytes of key material.
+        assert_eq!(
+            run(j.as_bytes(), 100_000).1.unwrap_err().reason,
+            "too complex"
+        );
+        assert!(run(j.as_bytes(), 10_000_000).1.is_ok());
+    }
+
+    #[test]
+    fn normal_input_stays_far_under_budget() {
+        let mut j = String::from(r#"{"messages":["#);
+        for i in 0..20_000 {
+            if i > 0 {
+                j.push(',');
+            }
+            j.push_str(r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#);
+        }
+        j.push_str("]}");
+        let mut s = Scanner {
+            b: j.as_bytes(),
+            pos: 0,
+            path: Vec::new(),
+            out: Vec::new(),
+            cur_cost: 0,
+            spent: 0,
+            budget: MAX_PATH_BYTES,
+        };
+        s.value(0).unwrap();
+        assert!(s.spent < MAX_PATH_BYTES / 16, "spent {}", s.spent);
     }
 }
