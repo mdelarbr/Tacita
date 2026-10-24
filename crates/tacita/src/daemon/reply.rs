@@ -82,9 +82,11 @@ pub(super) async fn protected_reply(
                     return m.fail(StatusCode::BAD_GATEWAY, &message);
                 }
             };
+            m.cap_upstream(&raw);
             match restore_message(&raw, &app.pairs) {
                 Ok((restored, n)) => {
                     m.meta.restored = Some(n);
+                    m.cap_client(&restored);
                     Body::from(restored)
                 }
                 Err(e) => return unrestorable(m, &e.to_string()),

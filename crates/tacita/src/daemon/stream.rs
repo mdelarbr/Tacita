@@ -87,6 +87,7 @@ impl Restoring {
                     if self.hold_deadline.is_some_and(|d| Instant::now() >= d) {
                         return Some(self.hold_expired());
                     }
+                    self.m.cap_upstream(&chunk);
                     self.feed(&chunk)
                 }
                 Some(Err(e)) => self.upstream_ended(Some(short_reason(&e))),
@@ -101,6 +102,7 @@ impl Restoring {
 
     fn sent(&mut self, out: Vec<u8>) -> Bytes {
         self.last_sent = Instant::now();
+        self.m.cap_client(&out);
         Bytes::from(out)
     }
 
@@ -287,6 +289,7 @@ mod tests {
             meta: RequestMeta::default(),
             log: Arc::new(MetaLog::open(home.path()).unwrap()),
             start: std::time::Instant::now(),
+            cap: None,
         };
         let body = restoring_body(upstream, restorer, timing, m);
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();

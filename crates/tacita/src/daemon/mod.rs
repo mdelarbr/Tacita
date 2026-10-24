@@ -2,6 +2,7 @@
 
 pub mod forward;
 pub mod metalog;
+pub mod record;
 mod reply;
 pub mod route;
 mod stream;
@@ -29,6 +30,7 @@ use tacita_core::request::scrub_request;
 use crate::config::{self, Config, Protection, Provider};
 use crate::secrets::SecretStore;
 use metalog::{MetaLog, Observer, RequestMeta};
+use record::{Capture, Recorder};
 use route::Route;
 
 /// The real upstreams. Code constants, never config values.
@@ -91,6 +93,7 @@ struct App {
     /// The Step 0 dictionary, built once from `config`.
     pairs: Arc<Pairs>,
     log: Arc<MetaLog>,
+    recorder: Option<Arc<Recorder>>,
     next: AtomicU64,
 }
 
@@ -119,6 +122,12 @@ impl Server {
         let anthropic_host = host_label(&opts.anthropic_upstream)?;
         let pairs = config.pairs()?;
         let log = MetaLog::open(&opts.home).context("cannot open logs/requests.jsonl")?;
+        let recorder = match &config.step0.record_dir {
+            Some(dir) => Some(Arc::new(Recorder::for_run(dir).with_context(|| {
+                format!("cannot create step0.record_dir {}", dir.display())
+            })?)),
+            None => None,
+        };
         let app = Arc::new(App {
             client: forward::client(&opts.timing),
             pairs,
@@ -127,6 +136,7 @@ impl Server {
             port: addr.port(),
             anthropic_host,
             log: Arc::new(log),
+            recorder,
             next: AtomicU64::new(1),
         });
         Ok(Server { app, listener })
@@ -159,6 +169,8 @@ struct MetaHandle {
     meta: RequestMeta,
     log: Arc<MetaLog>,
     start: Instant,
+    /// The corpus side copy; `None` unless `step0.record_dir` is set.
+    cap: Option<Capture>,
 }
 
 impl MetaHandle {
@@ -166,7 +178,26 @@ impl MetaHandle {
     fn fail(mut self, status: StatusCode, message: &str) -> Response {
         self.meta.status = status.as_u16();
         self.meta.tacita_error = Some(message.to_string());
+        self.cap_client(&error_body(message));
         tacita_error(status, message)
+    }
+
+    fn cap_forwarded(&mut self, bytes: &[u8]) {
+        if let Some(c) = &mut self.cap {
+            c.forwarded(bytes);
+        }
+    }
+
+    fn cap_upstream(&mut self, bytes: &[u8]) {
+        if let Some(c) = &mut self.cap {
+            c.upstream(bytes);
+        }
+    }
+
+    fn cap_client(&mut self, bytes: &[u8]) {
+        if let Some(c) = &mut self.cap {
+            c.client(bytes);
+        }
     }
 }
 
@@ -174,6 +205,9 @@ impl Drop for MetaHandle {
     fn drop(&mut self) {
         self.meta.ms = self.start.elapsed().as_millis() as u64;
         self.log.append(&self.meta);
+        if let Some(c) = self.cap.take() {
+            c.finish(self.meta.n, self.meta.status);
+        }
     }
 }
 
@@ -194,6 +228,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         meta: RequestMeta::begin(n, &parts.method, &parts.uri, &parts.headers, secret),
         log: app.log.clone(),
         start,
+        cap: None,
     };
     match route::route(&parts.method, &parts.uri, &parts.headers, secret, app.port) {
         Route::Forbidden(reason) => {
@@ -240,11 +275,16 @@ async fn messages(
         }
     };
     m.meta.peek_request(&body);
+    m.cap = app
+        .recorder
+        .clone()
+        .map(|r| Capture::new(r, headers, &body));
     if let Some(probe) = app.config.step0.block_probe.as_deref()
         && contains(&body, probe.as_bytes())
     {
         m.meta.status = StatusCode::BAD_REQUEST.as_u16();
         m.meta.tacita_error = Some("block probe".to_string());
+        m.cap_client(&error_body(BLOCK_PROBE));
         return tacita_error(StatusCode::BAD_REQUEST, BLOCK_PROBE);
     }
     let state = match config::State::load(&app.opts.home) {
@@ -291,6 +331,7 @@ async fn messages(
         url.push('?');
         url.push_str(q);
     }
+    m.cap_forwarded(&body);
     let sent = app
         .client
         .post(url)
@@ -320,6 +361,7 @@ fn scrub(app: &App, m: &mut MetaHandle, body: &[u8]) -> Result<Vec<u8>, Box<Resp
             let message = format!("could not read this request: {}", bounded(&e.to_string()));
             m.meta.status = StatusCode::BAD_REQUEST.as_u16();
             m.meta.tacita_error = Some(message.clone());
+            m.cap_client(&error_body(&message));
             Err(Box::new(tacita_error(StatusCode::BAD_REQUEST, &message)))
         }
     }
@@ -383,6 +425,7 @@ async fn openrouter(
         Err(e) => return m.fail(StatusCode::BAD_REQUEST, bounded(&e.to_string())),
     };
     m.meta.model_out = Some(slug.to_string());
+    m.cap_forwarded(&body);
     let url = format!(
         "{}/v1/messages",
         app.opts.openrouter_upstream.trim_end_matches('/')
@@ -477,7 +520,11 @@ fn pass_through(upstream: reqwest::Response, mut m: MetaHandle) -> Response {
     };
     let body = upstream.bytes_stream().map(move |item| {
         match &item {
-            Ok(bytes) => side.observer.feed(&mut side.m.meta, bytes),
+            Ok(bytes) => {
+                side.observer.feed(&mut side.m.meta, bytes);
+                side.m.cap_upstream(bytes);
+                side.m.cap_client(bytes);
+            }
             Err(e) => {
                 side.m.meta.tacita_error =
                     Some(format!("the upstream reply broke off: {}", short_reason(e)));

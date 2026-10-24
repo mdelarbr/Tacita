@@ -120,6 +120,8 @@ pub enum ConfigError {
     Pairs(PairsError),
     #[error("step0.record_dir must be an absolute path")]
     RecordDirNotAbsolute,
+    #[error("step0.record_dir is inside a git repository; choose a folder outside any repo")]
+    RecordDirInRepo,
     #[error("config.toml already exists; refusing to overwrite it")]
     ConfigExists,
     #[error(
@@ -150,6 +152,19 @@ fn pairs_text(e: &PairsError) -> &'static str {
         }
         PairsError::ReplacementChar(_) => "step0.pairs is invalid: a real value contains U+FFFD",
     }
+}
+
+/// True if `dir` or any ancestor holds an entry named `.git` (a directory,
+/// or the file a worktree has). `dir` may not exist yet, so its nearest
+/// existing ancestor is also checked after resolving symlinks.
+fn in_git_repo(dir: &Path) -> bool {
+    let has_git = |p: &Path| p.join(".git").symlink_metadata().is_ok();
+    if dir.ancestors().any(has_git) {
+        return true;
+    }
+    dir.ancestors()
+        .find_map(|a| a.canonicalize().ok())
+        .is_some_and(|real| real.ancestors().any(has_git))
 }
 
 fn io_err(file: &str, source: std::io::Error) -> ConfigError {
@@ -209,6 +224,11 @@ impl Config {
             && !d.is_absolute()
         {
             return Err(ConfigError::RecordDirNotAbsolute);
+        }
+        if let Some(d) = &self.step0.record_dir
+            && in_git_repo(d)
+        {
+            return Err(ConfigError::RecordDirInRepo);
         }
         Ok(())
     }
