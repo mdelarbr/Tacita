@@ -42,7 +42,7 @@ pub fn decode(lit: &[u8]) -> Result<Decoded, StrError> {
     if lit.first() != Some(&b'"') {
         return Err(StrError::NotAString);
     }
-    std::str::from_utf8(lit).map_err(|_| StrError::BadUtf8)?;
+    let src = std::str::from_utf8(lit).map_err(|_| StrError::BadUtf8)?;
     let mut text = String::new();
     let mut map = Vec::new();
     let mut push = |text: &mut String, c: char, start: usize| {
@@ -108,8 +108,7 @@ pub fn decode(lit: &[u8]) -> Result<Decoded, StrError> {
             }
             _ => {
                 // Valid UTF-8 was checked above, so this slice starts on a char boundary.
-                let s = std::str::from_utf8(&lit[i..]).map_err(|_| StrError::BadUtf8)?;
-                let c = s.chars().next().ok_or(StrError::Unterminated)?;
+                let c = src[i..].chars().next().ok_or(StrError::Unterminated)?;
                 push(&mut text, c, i);
                 i += c.len_utf8();
             }
@@ -176,7 +175,7 @@ mod tests {
     }
     #[test]
     fn match_spanning_an_escape_is_replaced_whole() {
-        let lit = br#""AcmeWidgets""#;
+        let lit = br#""Acme\u0057idgets""#;
         let d = decode(lit).unwrap();
         assert_eq!(d.text, "AcmeWidgets");
         assert_eq!(replace(lit, &d, &[(0..11, "ClientX01")]), br#""ClientX01""#.to_vec());
@@ -193,6 +192,14 @@ mod tests {
     fn rejects_raw_control_and_bad_escape() {
         assert!(matches!(decode(b"\"a\nb\""), Err(StrError::RawControl(_))));
         assert!(matches!(decode(br#""\q""#), Err(StrError::BadEscape(_))));
+    }
+    #[test]
+    fn decodes_one_mib_raw_literal() {
+        let unit = "ab\u{e9}\u{4e2d}\u{1F600}";
+        let body = unit.repeat((1 << 20) / unit.len());
+        let lit = format!("\"{body}\"");
+        let d = decode(lit.as_bytes()).unwrap();
+        assert_eq!(d.text, body);
     }
     proptest::proptest! {
         #[test]
