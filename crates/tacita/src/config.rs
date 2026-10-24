@@ -122,6 +122,8 @@ pub enum ConfigError {
     RecordDirNotAbsolute,
     #[error("step0.record_dir is inside a git repository; choose a folder outside any repo")]
     RecordDirInRepo,
+    #[error("step0.record_dir must not contain `.` or `..`")]
+    RecordDirNotNormal,
     #[error("config.toml already exists; refusing to overwrite it")]
     ConfigExists,
     #[error(
@@ -157,7 +159,7 @@ fn pairs_text(e: &PairsError) -> &'static str {
 /// True if `dir` or any ancestor holds an entry named `.git` (a directory,
 /// or the file a worktree has). `dir` may not exist yet, so its nearest
 /// existing ancestor is also checked after resolving symlinks.
-fn in_git_repo(dir: &Path) -> bool {
+pub(crate) fn in_git_repo(dir: &Path) -> bool {
     let has_git = |p: &Path| p.join(".git").symlink_metadata().is_ok();
     if dir.ancestors().any(has_git) {
         return true;
@@ -224,6 +226,16 @@ impl Config {
             && !d.is_absolute()
         {
             return Err(ConfigError::RecordDirNotAbsolute);
+        }
+        if let Some(d) = &self.step0.record_dir
+            && d.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(ConfigError::RecordDirNotNormal);
         }
         if let Some(d) = &self.step0.record_dir
             && in_git_repo(d)

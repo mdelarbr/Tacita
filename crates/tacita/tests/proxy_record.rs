@@ -294,16 +294,24 @@ async fn numbering_matches_the_meta_line_and_runs_do_not_clobber() {
             Arc::new(MemoryStore::default()),
         )
         .await;
+        // A non-Messages request takes number 1.
+        let hello = reqwest::Client::new()
+            .head(format!("{}/api/hello", t.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hello.status(), 200);
         post(&t, body("a")).await.bytes().await.unwrap();
-        let lines = meta_lines(&t, 1).await;
+        let lines = meta_lines(&t, 2).await;
         assert_eq!(lines[0]["n"], 1);
+        assert_eq!(lines[1]["n"], 2);
         homes.push(t);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let runs = run_dirs(corpus.path());
-        if runs.len() == 2 && runs.iter().all(|r| r.join("000001-meta.json").exists()) {
+        if runs.len() == 2 && runs.iter().all(|r| r.join("000002-meta.json").exists()) {
             assert!(
                 runs.iter()
                     .all(|r| r.file_name().unwrap().to_str().unwrap().starts_with("run-"))
@@ -333,12 +341,7 @@ async fn nothing_is_written_without_record_dir() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    assert!(
-        names
-            .iter()
-            .all(|n| !n.contains("run-") && !n.contains("corpus")),
-        "{names:?}"
-    );
+    assert_eq!(names, ["config.toml", "logs"]);
 }
 
 #[tokio::test]
@@ -406,11 +409,59 @@ fn record_dir_in_worktree_with_git_file_or_behind_symlink_is_refused() {
     ));
     let repo = tempfile::tempdir().unwrap();
     std::fs::create_dir(repo.path().join(".git")).unwrap();
+    // Only canonicalize sees the repo behind a link to a subdirectory.
+    std::fs::create_dir(repo.path().join("sub")).unwrap();
     let links = tempfile::tempdir().unwrap();
     let link = links.path().join("l");
-    std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+    std::os::unix::fs::symlink(repo.path().join("sub"), &link).unwrap();
     assert!(matches!(
         load(&link.join("corpus")),
         Err(ConfigError::RecordDirInRepo)
     ));
+}
+
+#[test]
+fn record_dir_with_dot_segments_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("repo/.git")).unwrap();
+    let e = load(&t.path().join("missing/../repo/corpus"))
+        .err()
+        .unwrap();
+    assert!(matches!(e, ConfigError::RecordDirNotNormal), "{e}");
+    assert!(e.to_string().contains("`.` or `..`"), "{e}");
+}
+
+#[tokio::test]
+async fn recording_does_not_delay_the_stream() {
+    let corpus = tempfile::tempdir().unwrap();
+    let first = sse(&[("ping", json!({"type":"ping"}))]);
+    let second = stop_only();
+    let t = start(
+        &with_record_dir(CONFIG_OFF, corpus.path()),
+        None,
+        vec![Reply::chunks(
+            200,
+            &[("content-type", "text/event-stream")],
+            vec![(0, first.clone()), (400, second.clone())],
+        )],
+        vec![],
+        Arc::new(MemoryStore::default()),
+    )
+    .await;
+    let sent = Instant::now();
+    let mut resp = post(&t, body("hi")).await;
+    let chunk = resp.chunk().await.unwrap().unwrap();
+    assert!(
+        sent.elapsed() < Duration::from_millis(300),
+        "{:?}",
+        sent.elapsed()
+    );
+    assert_eq!(chunk, first);
+    let mut rest = Vec::new();
+    while let Some(c) = resp.chunk().await.unwrap() {
+        rest.extend_from_slice(&c);
+    }
+    assert_eq!(rest, second);
+    let f = files(corpus.path(), 1).await;
+    assert_eq!(f[3], [first, second].concat());
 }

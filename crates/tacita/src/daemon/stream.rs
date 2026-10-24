@@ -84,10 +84,10 @@ impl Restoring {
             };
             let out = match item {
                 Some(Ok(chunk)) => {
+                    self.m.cap_upstream(&chunk);
                     if self.hold_deadline.is_some_and(|d| Instant::now() >= d) {
                         return Some(self.hold_expired());
                     }
-                    self.m.cap_upstream(&chunk);
                     self.feed(&chunk)
                 }
                 Some(Err(e)) => self.upstream_ended(Some(short_reason(&e))),
@@ -102,8 +102,9 @@ impl Restoring {
 
     fn sent(&mut self, out: Vec<u8>) -> Bytes {
         self.last_sent = Instant::now();
+        let out = Bytes::from(out);
         self.m.cap_client(&out);
-        Bytes::from(out)
+        out
     }
 
     /// Parses `chunk` and pushes its events through the restorer.
@@ -348,6 +349,55 @@ mod tests {
         // first chunk past the 130 ms deadline ends it, long before the end.
         let n = pulled.load(Ordering::SeqCst);
         assert!((4..10).contains(&n), "{n}");
+    }
+
+    #[tokio::test]
+    async fn the_chunk_that_trips_the_hold_deadline_is_still_recorded() {
+        use crate::daemon::record::{Capture, Recorder};
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let mut chunks = vec![sse(&[(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}),
+        )])];
+        for _ in 0..20 {
+            chunks.push(sse(&[(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            )]));
+        }
+        let pulled: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let seen = pulled.clone();
+        let upstream = futures_util::stream::iter(chunks).map(move |c| {
+            std::thread::sleep(Duration::from_millis(30));
+            seen.lock().unwrap().extend_from_slice(&c);
+            Ok(Bytes::from(c))
+        });
+        let timing = Timing {
+            ping_every: Duration::from_secs(10),
+            hold_limit: Duration::from_millis(100),
+            ..Timing::default()
+        };
+        let home = tempfile::tempdir().unwrap();
+        let corpus = tempfile::tempdir().unwrap();
+        let rec = Arc::new(Recorder::new(&corpus.path().join("r")).unwrap());
+        let m = MetaHandle {
+            meta: RequestMeta::default(),
+            log: Arc::new(MetaLog::open(home.path()).unwrap()),
+            start: std::time::Instant::now(),
+            cap: Some(Capture::new(rec, &Default::default(), Default::default())),
+        };
+        let restorer = Restorer::new(pairs(), Limits::default(), None);
+        let body = restoring_body(upstream, restorer, timing, m);
+        axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let file = corpus.path().join("r/000000-upstream.txt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !corpus.path().join("r/000000-meta.json").exists() {
+            assert!(std::time::Instant::now() < deadline, "not written");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pulled = pulled.lock().unwrap().clone();
+        assert_eq!(std::fs::read(file).unwrap(), pulled);
     }
 
     #[test]

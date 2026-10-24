@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
+use bytes::Bytes;
 use serde_json::json;
 
 use crate::paths;
@@ -41,10 +42,11 @@ pub struct Recorder {
 pub struct RecordParts {
     pub headers: BTreeMap<String, String>,
     pub status: u16,
-    pub request: Vec<u8>,
-    pub forwarded: Vec<u8>,
-    pub upstream: Vec<u8>,
-    pub client: Vec<u8>,
+    pub request: Bytes,
+    pub forwarded: Bytes,
+    /// Chunks as they passed (refcounted, not copied); joined in `save`.
+    pub upstream: Vec<Bytes>,
+    pub client: Vec<Bytes>,
     pub truncated: bool,
 }
 
@@ -77,6 +79,10 @@ impl Recorder {
         ))
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Writes the five files, `meta` last. Never overwrites. Errors go to
     /// stderr only.
     pub fn save(&self, n: u64, parts: RecordParts) {
@@ -87,16 +93,16 @@ impl Recorder {
             "headers": parts.headers,
         })
         .to_string();
-        let files: [(&str, &[u8]); 5] = [
-            ("request.json", &parts.request),
-            ("forwarded.json", &parts.forwarded),
-            ("upstream.txt", &parts.upstream),
-            ("client.txt", &parts.client),
-            ("meta.json", meta.as_bytes()),
+        let files: [(&str, Vec<u8>); 5] = [
+            ("request.json", parts.request.to_vec()),
+            ("forwarded.json", parts.forwarded.to_vec()),
+            ("upstream.txt", parts.upstream.concat()),
+            ("client.txt", parts.client.concat()),
+            ("meta.json", meta.into_bytes()),
         ];
         for (suffix, bytes) in files {
             let path = self.dir.join(format!("{n:06}-{suffix}"));
-            if let Err(e) = paths::create_private_new(&path, bytes) {
+            if let Err(e) = paths::create_private_new(&path, &bytes) {
                 let _ = writeln!(
                     io::stderr(),
                     "Tacita: cannot record {}: {e}",
@@ -126,9 +132,11 @@ pub fn header_map(headers: &HeaderMap) -> BTreeMap<String, String> {
     out
 }
 
-/// Bytes copied up to a limit.
+/// Chunks kept up to a length limit. A chunk is a refcounted `Bytes` clone,
+/// so nothing is copied while the reply passes.
 struct Buf {
-    data: Vec<u8>,
+    chunks: Vec<Bytes>,
+    len: usize,
     limit: usize,
     truncated: bool,
 }
@@ -136,18 +144,23 @@ struct Buf {
 impl Buf {
     fn new(limit: usize) -> Buf {
         Buf {
-            data: Vec::new(),
+            chunks: Vec::new(),
+            len: 0,
             limit,
             truncated: false,
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) {
-        let room = self.limit - self.data.len();
+    fn push(&mut self, bytes: &Bytes) {
+        let room = self.limit - self.len;
         if bytes.len() > room {
             self.truncated = true;
         }
-        self.data.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        let keep = bytes.len().min(room);
+        if keep > 0 {
+            self.chunks.push(bytes.slice(..keep));
+            self.len += keep;
+        }
     }
 }
 
@@ -155,42 +168,42 @@ impl Buf {
 pub struct Capture {
     rec: Arc<Recorder>,
     headers: BTreeMap<String, String>,
-    request: Vec<u8>,
-    forwarded: Vec<u8>,
+    request: Bytes,
+    forwarded: Bytes,
     upstream: Buf,
     client: Buf,
 }
 
 impl Capture {
-    pub fn new(rec: Arc<Recorder>, headers: &HeaderMap, request: &[u8]) -> Capture {
+    pub fn new(rec: Arc<Recorder>, headers: &HeaderMap, request: Bytes) -> Capture {
         Capture::with_limit(rec, headers, request, MAX_CAPTURE)
     }
 
     fn with_limit(
         rec: Arc<Recorder>,
         headers: &HeaderMap,
-        request: &[u8],
+        request: Bytes,
         limit: usize,
     ) -> Capture {
         Capture {
             rec,
             headers: header_map(headers),
-            request: request.to_vec(),
-            forwarded: Vec::new(),
+            request,
+            forwarded: Bytes::new(),
             upstream: Buf::new(limit),
             client: Buf::new(limit),
         }
     }
 
-    pub fn forwarded(&mut self, bytes: &[u8]) {
-        self.forwarded = bytes.to_vec();
+    pub fn forwarded(&mut self, bytes: Bytes) {
+        self.forwarded = bytes;
     }
 
-    pub fn upstream(&mut self, bytes: &[u8]) {
+    pub fn upstream(&mut self, bytes: &Bytes) {
         self.upstream.push(bytes);
     }
 
-    pub fn client(&mut self, bytes: &[u8]) {
+    pub fn client(&mut self, bytes: &Bytes) {
         self.client.push(bytes);
     }
 
@@ -202,8 +215,8 @@ impl Capture {
             request: self.request,
             forwarded: self.forwarded,
             truncated: self.upstream.truncated || self.client.truncated,
-            upstream: self.upstream.data,
-            client: self.client.data,
+            upstream: self.upstream.chunks,
+            client: self.client.chunks,
         };
         let rec = self.rec;
         match tokio::runtime::Handle::try_current() {
@@ -224,22 +237,27 @@ mod tests {
     #[test]
     fn buf_stops_at_the_limit_and_says_so() {
         let mut b = Buf::new(5);
-        b.push(b"abc");
+        b.push(&Bytes::from_static(b"abc"));
         assert!(!b.truncated);
-        b.push(b"defg");
-        assert_eq!(b.data, b"abcde");
+        b.push(&Bytes::from_static(b"defg"));
+        assert_eq!(b.chunks.concat(), b"abcde");
         assert!(b.truncated);
-        b.push(b"h");
-        assert_eq!(b.data, b"abcde");
+        b.push(&Bytes::from_static(b"h"));
+        assert_eq!(b.chunks.concat(), b"abcde");
     }
 
     #[test]
     fn capture_truncation_reaches_the_meta_file() {
         let t = tempfile::tempdir().unwrap();
         let rec = Arc::new(Recorder::new(&t.path().join("r")).unwrap());
-        let mut c = Capture::with_limit(rec.clone(), &HeaderMap::new(), b"req", 4);
-        c.upstream(b"123456");
-        c.client(b"ab");
+        let mut c = Capture::with_limit(
+            rec.clone(),
+            &HeaderMap::new(),
+            Bytes::from_static(b"req"),
+            4,
+        );
+        c.upstream(&Bytes::from_static(b"123456"));
+        c.client(&Bytes::from_static(b"ab"));
         // No runtime here: `finish` saves inline.
         c.finish(7, 200);
         let r = t.path().join("r");
@@ -265,8 +283,8 @@ mod tests {
             RecordParts {
                 headers: BTreeMap::new(),
                 status: 1,
-                request: b"other".to_vec(),
-                forwarded: vec![],
+                request: Bytes::from_static(b"other"),
+                forwarded: Bytes::new(),
                 upstream: vec![],
                 client: vec![],
                 truncated: false,

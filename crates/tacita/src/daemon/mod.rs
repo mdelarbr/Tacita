@@ -21,6 +21,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::serve::ListenerExt;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use tacita_core::errors::error_body;
 use tacita_core::openrouter::{Prefs, adapt_request};
@@ -123,9 +124,7 @@ impl Server {
         let pairs = config.pairs()?;
         let log = MetaLog::open(&opts.home).context("cannot open logs/requests.jsonl")?;
         let recorder = match &config.step0.record_dir {
-            Some(dir) => Some(Arc::new(Recorder::for_run(dir).with_context(|| {
-                format!("cannot create step0.record_dir {}", dir.display())
-            })?)),
+            Some(dir) => Some(Arc::new(open_recorder(dir)?)),
             None => None,
         };
         let app = Arc::new(App {
@@ -154,6 +153,24 @@ impl Server {
     }
 }
 
+/// Creates this run's corpus directory.
+/// The created directory is checked again, resolved, because the config
+/// check cannot see a repo made since, nor every way a path can lead into
+/// one; inside a repo the daemon refuses to start.
+fn open_recorder(dir: &std::path::Path) -> anyhow::Result<Recorder> {
+    let rec = Recorder::for_run(dir)
+        .with_context(|| format!("cannot create step0.record_dir {}", dir.display()))?;
+    let real = rec
+        .dir()
+        .canonicalize()
+        .unwrap_or_else(|_| rec.dir().to_path_buf());
+    if config::in_git_repo(&real) {
+        let _ = std::fs::remove_dir(rec.dir());
+        return Err(config::ConfigError::RecordDirInRepo.into());
+    }
+    Ok(rec)
+}
+
 fn host_label(upstream: &str) -> anyhow::Result<String> {
     let url = reqwest::Url::parse(upstream).context("invalid upstream URL")?;
     let host = url.host_str().context("upstream URL has no host")?;
@@ -178,23 +195,24 @@ impl MetaHandle {
     fn fail(mut self, status: StatusCode, message: &str) -> Response {
         self.meta.status = status.as_u16();
         self.meta.tacita_error = Some(message.to_string());
-        self.cap_client(&error_body(message));
-        tacita_error(status, message)
+        let body = Bytes::from(error_body(message));
+        self.cap_client(&body);
+        error_response(status, body)
     }
 
-    fn cap_forwarded(&mut self, bytes: &[u8]) {
+    fn cap_forwarded(&mut self, bytes: &Bytes) {
         if let Some(c) = &mut self.cap {
-            c.forwarded(bytes);
+            c.forwarded(bytes.clone());
         }
     }
 
-    fn cap_upstream(&mut self, bytes: &[u8]) {
+    fn cap_upstream(&mut self, bytes: &Bytes) {
         if let Some(c) = &mut self.cap {
             c.upstream(bytes);
         }
     }
 
-    fn cap_client(&mut self, bytes: &[u8]) {
+    fn cap_client(&mut self, bytes: &Bytes) {
         if let Some(c) = &mut self.cap {
             c.client(bytes);
         }
@@ -211,8 +229,8 @@ impl Drop for MetaHandle {
     }
 }
 
-fn tacita_error(status: StatusCode, message: &str) -> Response {
-    let mut r = Response::new(Body::from(error_body(message)));
+fn error_response(status: StatusCode, body: Bytes) -> Response {
+    let mut r = Response::new(Body::from(body));
     *r.status_mut() = status;
     r.headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -266,7 +284,7 @@ async fn messages(
     query: Option<String>,
 ) -> Response {
     let body = match read_body(body).await {
-        Ok(b) => b,
+        Ok(b) => Bytes::from(b),
         Err(BodyError::TooLarge) => {
             return m.fail(StatusCode::PAYLOAD_TOO_LARGE, "request larger than 64 MiB");
         }
@@ -278,14 +296,15 @@ async fn messages(
     m.cap = app
         .recorder
         .clone()
-        .map(|r| Capture::new(r, headers, &body));
+        .map(|r| Capture::new(r, headers, body.clone()));
     if let Some(probe) = app.config.step0.block_probe.as_deref()
         && contains(&body, probe.as_bytes())
     {
         m.meta.status = StatusCode::BAD_REQUEST.as_u16();
         m.meta.tacita_error = Some("block probe".to_string());
-        m.cap_client(&error_body(BLOCK_PROBE));
-        return tacita_error(StatusCode::BAD_REQUEST, BLOCK_PROBE);
+        let reply = Bytes::from(error_body(BLOCK_PROBE));
+        m.cap_client(&reply);
+        return error_response(StatusCode::BAD_REQUEST, reply);
     }
     let state = match config::State::load(&app.opts.home) {
         Ok(s) => s,
@@ -316,7 +335,7 @@ async fn messages(
     let protected = protection != Protection::Off;
     let body = if protected {
         match scrub(app, &mut m, &body) {
-            Ok(b) => b,
+            Ok(b) => Bytes::from(b),
             Err(resp) => return *resp,
         }
     } else {
@@ -361,8 +380,9 @@ fn scrub(app: &App, m: &mut MetaHandle, body: &[u8]) -> Result<Vec<u8>, Box<Resp
             let message = format!("could not read this request: {}", bounded(&e.to_string()));
             m.meta.status = StatusCode::BAD_REQUEST.as_u16();
             m.meta.tacita_error = Some(message.clone());
-            m.cap_client(&error_body(&message));
-            Err(Box::new(tacita_error(StatusCode::BAD_REQUEST, &message)))
+            let reply = Bytes::from(error_body(&message));
+            m.cap_client(&reply);
+            Err(Box::new(error_response(StatusCode::BAD_REQUEST, reply)))
         }
     }
 }
@@ -374,7 +394,7 @@ async fn openrouter(
     app: &App,
     mut m: MetaHandle,
     headers: &HeaderMap,
-    body: Vec<u8>,
+    body: Bytes,
     state: &config::State,
 ) -> Response {
     let Some(slug) = state.openrouter_model.as_deref() else {
@@ -421,7 +441,7 @@ async fn openrouter(
         only: app.config.openrouter.only.clone(),
     };
     let body = match adapt_request(&scrubbed, slug, &prefs) {
-        Ok(b) => b,
+        Ok(b) => Bytes::from(b),
         Err(e) => return m.fail(StatusCode::BAD_REQUEST, bounded(&e.to_string())),
     };
     m.meta.model_out = Some(slug.to_string());
@@ -554,6 +574,23 @@ impl Drop for Side {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repo_that_appears_after_the_config_check_stops_the_daemon() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().join("corpus");
+        // The config check passed; then the folder became a repo.
+        std::fs::create_dir(t.path().join(".git")).unwrap();
+        let e = open_recorder(&base).err().expect("must refuse");
+        assert!(matches!(
+            e.downcast_ref::<config::ConfigError>(),
+            Some(config::ConfigError::RecordDirInRepo)
+        ));
+        assert!(
+            std::fs::read_dir(&base).unwrap().next().is_none(),
+            "the run directory is removed again"
+        );
+    }
 
     #[test]
     fn bounded_cuts_at_a_char_boundary() {

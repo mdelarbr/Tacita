@@ -5,6 +5,7 @@ use axum::body::Body;
 use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use tacita_core::restore::{Limits, Restorer, restore_message};
 
@@ -82,10 +83,12 @@ pub(super) async fn protected_reply(
                     return m.fail(StatusCode::BAD_GATEWAY, &message);
                 }
             };
+            let raw = Bytes::from(raw);
             m.cap_upstream(&raw);
             match restore_message(&raw, &app.pairs) {
                 Ok((restored, n)) => {
                     m.meta.restored = Some(n);
+                    let restored = Bytes::from(restored);
                     m.cap_client(&restored);
                     Body::from(restored)
                 }
