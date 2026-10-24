@@ -26,10 +26,15 @@ impl SseEvent {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+/// Largest unfinished event the parser will buffer.
+pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 pub enum SseError {
     #[error("invalid UTF-8 in SSE event")]
     Utf8,
+    #[error("SSE event exceeds the size cap")]
+    EventTooLarge,
 }
 
 #[derive(Default)]
@@ -44,14 +49,22 @@ pub struct SseParser {
     event: Option<Vec<u8>>,
     data: Vec<u8>,
     has_data: bool,
+    /// Once set, every `push` returns this error.
+    poisoned: Option<SseError>,
+    /// Test-only override of `MAX_EVENT_BYTES`.
+    max_override: Option<usize>,
 }
 
 impl SseParser {
+    /// Returns the events completed before any error; the error itself is
+    /// returned at once if there are none, otherwise by the next call.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseError> {
+        if let Some(e) = self.poisoned {
+            return Err(e);
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         let mut consumed = 0; // bytes of buf belonging to finished events
-        let mut error = None;
         'lines: loop {
             let mut i = self.scan;
             let term_end = loop {
@@ -78,7 +91,10 @@ impl SseParser {
                 consumed = term_end;
                 match self.finish_event(raw) {
                     Ok(ev) => out.push(ev),
-                    Err(e) => error = Some(e),
+                    Err(e) => {
+                        self.poisoned = Some(e);
+                        break;
+                    }
                 }
             } else {
                 self.field(self.line_start, line_end);
@@ -86,12 +102,20 @@ impl SseParser {
             self.line_start = term_end;
             self.scan = term_end;
         }
-        self.buf.drain(..consumed);
-        self.line_start -= consumed;
-        self.scan -= consumed;
-        match error {
-            Some(e) => Err(e),
-            None => Ok(out),
+        if self.poisoned.is_some() {
+            self.buf.clear();
+        } else {
+            self.buf.drain(..consumed);
+            self.line_start -= consumed;
+            self.scan -= consumed;
+            if self.buf.len() > self.max_override.unwrap_or(MAX_EVENT_BYTES) {
+                self.poisoned = Some(SseError::EventTooLarge);
+                self.buf.clear();
+            }
+        }
+        match self.poisoned {
+            Some(e) if out.is_empty() => Err(e),
+            _ => Ok(out),
         }
     }
 
@@ -181,6 +205,50 @@ mod tests {
     }
 
     #[test]
+    fn good_events_before_a_bad_one_survive_and_parser_is_poisoned() {
+        let input = b"data: ok
+
+data: \xff
+
+data: later
+
+";
+        // Byte by byte.
+        let mut p = SseParser::default();
+        let mut bytewise = Vec::new();
+        let mut err = None;
+        for b in input.chunks(1) {
+            match p.push(b) {
+                Ok(e) => bytewise.extend(e),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(err, Some(SseError::Utf8));
+        // All at once: the good events, then Err on the next push.
+        let mut q = SseParser::default();
+        let once = q.push(input).unwrap();
+        assert_eq!(once, bytewise);
+        assert_eq!(once.len(), 1);
+        assert_eq!(q.push(b"data: x\n\n").unwrap_err(), SseError::Utf8);
+        assert_eq!(q.push(b"").unwrap_err(), SseError::Utf8);
+    }
+
+    #[test]
+    fn oversized_unfinished_event_is_an_error_and_poisons() {
+        let mut p = SseParser { max_override: Some(64), ..Default::default() };
+        assert!(p.push(&[b'a'; 60]).unwrap().is_empty());
+        assert_eq!(p.push(&[b'a'; 10]).unwrap_err(), SseError::EventTooLarge);
+        assert_eq!(p.push(b"\n\n").unwrap_err(), SseError::EventTooLarge);
+        // Finished events are not counted against the cap.
+        let mut p = SseParser { max_override: Some(64), ..Default::default() };
+        let big = format!("data: {}\n\n", "a".repeat(50));
+        assert_eq!(p.push(big.repeat(5).as_bytes()).unwrap().len(), 5);
+    }
+
+    #[test]
     fn finish_returns_unterminated_bytes() {
         let mut p = SseParser::default();
         p.push(b"data: partial").unwrap();
@@ -236,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn one_mib_line_in_small_chunks_is_linear() {
+    fn one_mib_event_in_small_chunks() {
         let big = "x".repeat(1 << 20);
         let stream = format!("event: big\ndata: {big}\n\n");
         let mut p = SseParser::default();
