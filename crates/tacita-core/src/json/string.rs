@@ -271,7 +271,7 @@ mod tests {
     }
     proptest::proptest! {
         #[test]
-        fn encode_round_trips(s in ".*") {
+        fn encode_round_trips(s in "(?s).*") {
             let lit = encode(&s);
             proptest::prop_assert_eq!(serde_json::from_str::<String>(&lit).unwrap(), s.clone());
             proptest::prop_assert_eq!(decode(lit.as_bytes()).unwrap().text, s);
