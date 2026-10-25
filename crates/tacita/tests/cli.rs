@@ -336,9 +336,14 @@ fn spawn_daemon(
 
 /// Sends SIGINT and waits up to 5 s for the exit.
 fn interrupt(d: &mut Daemon) -> std::process::ExitStatus {
+    send_signal(d, "INT")
+}
+
+/// Sends SIG`name` and waits up to 5 s for the exit.
+fn send_signal(d: &mut Daemon, name: &str) -> std::process::ExitStatus {
     use std::time::{Duration, Instant};
     let killed = std::process::Command::new("kill")
-        .args(["-INT", &d.0.id().to_string()])
+        .args([&format!("-{name}"), &d.0.id().to_string()])
         .status()
         .unwrap();
     assert!(killed.success());
@@ -347,8 +352,25 @@ fn interrupt(d: &mut Daemon) -> std::process::ExitStatus {
         if let Some(s) = d.0.try_wait().unwrap() {
             return s;
         }
-        assert!(Instant::now() < deadline, "daemon did not stop on SIGINT");
+        assert!(Instant::now() < deadline, "daemon did not stop on SIG{name}");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn daemon_stops_gracefully_on_sigterm_and_sighup() {
+    // launchd and `kill` send SIGTERM; closing the terminal sends SIGHUP.
+    use std::io::Read;
+    for name in ["TERM", "HUP"] {
+        let home = tempfile::tempdir().unwrap();
+        init_on_port(home.path(), free_port());
+        let (mut d, mut stdout, banner) = spawn_daemon(home.path(), std::process::Stdio::null());
+        assert!(banner.starts_with("Tacita listening on "), "{banner}");
+        let status = send_signal(&mut d, name);
+        assert_eq!(status.code(), Some(0), "SIG{name}: {status:?}");
+        let mut rest = String::new();
+        stdout.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "Tacita stopped\n", "SIG{name}");
     }
 }
 

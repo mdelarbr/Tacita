@@ -172,7 +172,7 @@ async fn print_status(home: &Path, cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Binds 127.0.0.1 only and serves until Ctrl-C.
+/// Binds 127.0.0.1 only and serves until Ctrl-C, SIGTERM or SIGHUP.
 async fn run_daemon(home: std::path::PathBuf) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
     let cfg = load_config(&home)?;
@@ -186,20 +186,30 @@ async fn run_daemon(home: std::path::PathBuf) -> Result<(), String> {
                 format!("cannot listen on 127.0.0.1:{port}: {e}")
             }
         })?;
-    // Registered before the banner, so a Ctrl-C right after it is caught.
-    let mut interrupt =
-        signal(SignalKind::interrupt()).map_err(|e| format!("cannot catch Ctrl-C: {e}"))?;
+    // Registered before the banner, so a signal right after it is caught.
+    // SIGTERM (launchd, `kill`) and SIGHUP (the terminal closed) stop it
+    // like Ctrl-C.
+    let catch = |kind: SignalKind, what: &str| {
+        signal(kind).map_err(|e| format!("cannot catch {what}: {e}"))
+    };
+    let mut interrupt = catch(SignalKind::interrupt(), "Ctrl-C")?;
+    let mut terminate = catch(SignalKind::terminate(), "SIGTERM")?;
+    let mut hangup = catch(SignalKind::hangup(), "SIGHUP")?;
     // The banner only once the config is reloaded and the log is open.
     let server =
         Server::new(DaemonOptions::production(home), listener).map_err(|e| format!("{e:#}"))?;
     println!("Tacita listening on {}", cfg.base_url());
     tokio::select! {
         served = server.run() => served.map_err(|e| format!("{e:#}")),
-        _ = interrupt.recv() => {
-            println!("Tacita stopped");
-            Ok(())
-        }
+        _ = interrupt.recv() => stopped(),
+        _ = terminate.recv() => stopped(),
+        _ = hangup.recv() => stopped(),
     }
+}
+
+fn stopped() -> Result<(), String> {
+    println!("Tacita stopped");
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
