@@ -43,6 +43,9 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 /// Longest reason put into a Tacita error or `tacita_error`.
 const MAX_REASON_BYTES: usize = 200;
 
+/// The hello header holding the daemon's `config_tag`.
+pub const CONFIG_TAG_HEADER: &str = "x-tacita-config";
+
 const BLOCK_PROBE: &str = "block probe: this request was blocked on purpose (Step 0)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +89,8 @@ impl DaemonOptions {
 struct App {
     opts: DaemonOptions,
     config: Config,
+    /// `config_tag` of the `config.toml` bytes `config` was loaded from.
+    config_tag: String,
     /// The listener's port, for the Host check.
     port: u16,
     /// `host[:port]` of the Anthropic upstream, for error messages.
@@ -111,7 +116,8 @@ pub struct Server {
 }
 
 impl Server {
-    /// Loads `Config` once; it is not reloaded while serving.
+    /// Loads `Config` once; it is not reloaded while serving. A request
+    /// that finds `config.toml` changed since is refused.
     pub fn new(opts: DaemonOptions, listener: tokio::net::TcpListener) -> anyhow::Result<Server> {
         let addr = listener.local_addr()?;
         anyhow::ensure!(
@@ -119,7 +125,7 @@ impl Server {
             "Tacita listens on 127.0.0.1 only, not {}",
             addr.ip()
         );
-        let config = Config::load(&opts.home)?;
+        let (config, config_tag) = Config::load_tagged(&opts.home)?;
         let anthropic_host = host_label(&opts.anthropic_upstream)?;
         let pairs = config.pairs()?;
         let log = MetaLog::open(&opts.home).context("cannot open logs/requests.jsonl")?;
@@ -132,6 +138,7 @@ impl Server {
             pairs,
             opts,
             config,
+            config_tag,
             port: addr.port(),
             anthropic_host,
             log: Arc::new(log),
@@ -267,7 +274,11 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         Route::Hello => {
             m.meta.route = "hello";
             m.meta.status = 200;
-            Response::new(Body::empty())
+            let mut resp = Response::new(Body::empty());
+            if let Ok(tag) = HeaderValue::from_str(&app.config_tag) {
+                resp.headers_mut().insert(CONFIG_TAG_HEADER, tag);
+            }
+            resp
         }
         Route::Messages { query } => {
             m.meta.route = "messages";
@@ -297,6 +308,17 @@ async fn messages(
         .recorder
         .clone()
         .map(|r| Capture::new(r, headers, body.clone()));
+    // `tacita status` reads the file; a daemon running an older one must
+    // not act on settings the owner no longer sees.
+    if config::current_config_tag(&app.opts.home).ok().as_ref() != Some(&app.config_tag) {
+        let mut resp = m.fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config.toml changed since the daemon started; restart `tacita daemon`",
+        );
+        resp.headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
+        return resp;
+    }
     if let Some(probe) = app.config.step0.block_probe.as_deref()
         && contains(&body, probe.as_bytes())
     {

@@ -281,6 +281,28 @@ fn daemon_listens_answers_hello_and_stops_on_ctrl_c() {
     assert!(log.contains(r#""route":"hello""#), "{log}");
 }
 
+#[test]
+fn status_says_when_the_daemon_runs_an_older_config() {
+    let home = tempfile::tempdir().unwrap();
+    init_on_port(home.path(), free_port());
+    let (mut d, _stdout, _banner) = spawn_daemon(home.path(), std::process::Stdio::null());
+    let daemon_line = || {
+        out(&run_in(home.path(), &["status"]))
+            .lines()
+            .find(|l| l.starts_with("daemon:"))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(daemon_line(), "daemon:     running");
+    let file = home.path().join("config.toml");
+    let cfg = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, cfg.replace("\"off\"     #", "\"pairs\"   #")).unwrap();
+    assert_eq!(daemon_line(), "daemon:     running (config changed: restart it)");
+    std::fs::write(&file, &cfg).unwrap();
+    assert_eq!(daemon_line(), "daemon:     running");
+    assert!(interrupt(&mut d).success());
+}
+
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()

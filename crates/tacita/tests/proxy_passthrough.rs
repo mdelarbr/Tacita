@@ -149,6 +149,9 @@ async fn hello_is_answered_locally() {
         .await
         .unwrap();
     assert_eq!(head.status(), 200);
+    // The tag of the config the daemon loaded, for `tacita status`.
+    let tag = tacita::config::config_tag(CONFIG_OFF.as_bytes());
+    assert_eq!(head.headers()["x-tacita-config"], tag.as_str());
     let get = c.get(format!("{}/api/hello", t.base)).send().await.unwrap();
     assert_eq!(get.status(), 200);
     assert!(get.bytes().await.unwrap().is_empty());
@@ -566,6 +569,46 @@ async fn meta_line_is_written_once_when_the_client_leaves() {
     assert_eq!(m[0]["stop_reason"], Value::Null);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(wait_for_lines(&t.log_path(), 2).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_changed_config_stops_forwarding_until_restarted() {
+    let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
+    let or = FakeUpstream::start(vec![]).await;
+    let t = start_off(&up, &or).await;
+    let send = || async {
+        reqwest::Client::new()
+            .post(format!("{}/v1/messages", t.base))
+            .body(MIN_BODY)
+            .send()
+            .await
+            .unwrap()
+    };
+    assert_eq!(send().await.status(), 200);
+    let file = t.home.join("config.toml");
+    let message = "config.toml changed since the daemon started; restart `tacita daemon`";
+    // Any byte changed (here only a comment), then the file gone.
+    let changed = CONFIG_OFF.replace("Step 0 test 1", "Step 0 test one");
+    for edit in [Some(changed.as_str()), None] {
+        match edit {
+            Some(text) => std::fs::write(&file, text).unwrap(),
+            None => std::fs::remove_file(&file).unwrap(),
+        }
+        let resp = send().await;
+        assert_eq!(resp.headers()["x-should-retry"], "false");
+        assert_eq!(tacita_error(resp, 500).await, format!("Tacita: {message}"));
+    }
+    assert_eq!(up.count(), 1);
+    // The same bytes again are the config the daemon runs on.
+    std::fs::write(&file, CONFIG_OFF).unwrap();
+    assert_eq!(send().await.status(), 200);
+    assert_eq!(up.count(), 2);
+    let m = meta_lines(&t, 4).await;
+    for line in &m[1..3] {
+        assert_eq!(line["status"], 500);
+        assert_eq!(line["tacita_error"], message);
+        assert_eq!(line["provider"], Value::Null);
+    }
 }
 
 #[tokio::test]

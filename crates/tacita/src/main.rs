@@ -2,8 +2,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tacita::config::{Config, ConfigError, Protection, Provider, State};
-use tacita::daemon::{DaemonOptions, Server};
+use tacita::config::{Config, ConfigError, Protection, Provider, State, current_config_tag};
+use tacita::daemon::{CONFIG_TAG_HEADER, DaemonOptions, Server};
 use tacita::paths;
 
 #[derive(Parser)]
@@ -120,19 +120,25 @@ fn session_line(cfg: &Config) -> String {
     )
 }
 
-async fn daemon_running(base_url: &str) -> bool {
-    let Ok(client) = reqwest::Client::builder()
+/// `None` when no daemon answers; else the config tag it sent, if any.
+async fn daemon_hello(base_url: &str) -> Option<Option<String>> {
+    let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(1))
         .build()
-    else {
-        return false;
-    };
-    match client.head(format!("{base_url}/api/hello")).send().await {
-        Ok(r) => r.status() == reqwest::StatusCode::OK,
-        Err(_) => false,
-    }
+        .ok()?;
+    let r = client
+        .head(format!("{base_url}/api/hello"))
+        .send()
+        .await
+        .ok()?;
+    (r.status() == reqwest::StatusCode::OK).then(|| {
+        r.headers()
+            .get(CONFIG_TAG_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    })
 }
 
 async fn print_status(home: &Path, cfg: &Config) -> Result<(), String> {
@@ -152,10 +158,12 @@ async fn print_status(home: &Path, cfg: &Config) -> Result<(), String> {
         Protection::Pairs => "pairs",
     };
     let base_url = cfg.base_url();
-    let daemon = if daemon_running(&base_url).await {
-        "running"
-    } else {
-        "not running"
+    // A daemon that loaded other bytes (or sends no tag) is not applying
+    // what this file says.
+    let daemon = match daemon_hello(&base_url).await {
+        None => "not running",
+        Some(tag) if tag.is_some() && tag == current_config_tag(home).ok() => "running",
+        Some(_) => "running (config changed: restart it)",
     };
     println!("provider:   {provider}");
     println!("protection: {protection}");

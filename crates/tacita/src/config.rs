@@ -188,13 +188,33 @@ fn toml_err(file: &str, text: &str, e: toml::de::Error) -> ConfigError {
     }
 }
 
+/// A tag for `config.toml`'s exact bytes, in hex. The daemon keeps the tag
+/// of the bytes it loaded, compares it with the file on every request, and
+/// sends it on `/api/hello` for `tacita status`.
+pub fn config_tag(bytes: &[u8]) -> String {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut h = DefaultHasher::new();
+    h.write(bytes);
+    format!("{:016x}", h.finish())
+}
+
+/// The tag of `config.toml` as it is on disk now.
+pub fn current_config_tag(home: &Path) -> std::io::Result<String> {
+    std::fs::read(home.join(CONFIG_FILE)).map(|b| config_tag(&b))
+}
+
 impl Config {
     pub fn load(home: &Path) -> Result<Config, ConfigError> {
+        Config::load_tagged(home).map(|(cfg, _)| cfg)
+    }
+
+    /// `load`, with the `config_tag` of the exact bytes read.
+    pub fn load_tagged(home: &Path) -> Result<(Config, String), ConfigError> {
         let text =
             std::fs::read_to_string(home.join(CONFIG_FILE)).map_err(|e| io_err(CONFIG_FILE, e))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| toml_err(CONFIG_FILE, &text, e))?;
         cfg.validate()?;
-        Ok(cfg)
+        Ok((cfg, config_tag(text.as_bytes())))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
