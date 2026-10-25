@@ -194,6 +194,14 @@ impl Restorer {
     }
 
     pub fn push(&mut self, ev: SseEvent) -> Result<Vec<SseEvent>, RestoreError> {
+        // The provider's own error goes on as it came, whatever its data,
+        // after the text carries: its message must not be lost, and the
+        // caller ends the stream after it.
+        if ev.event.as_deref() == Some("error") {
+            let mut out = self.flush_all()?;
+            out.push(ev);
+            return Ok(out);
+        }
         // Empty data never parses: comment-only blocks and stray blank lines
         // (no name) go out raw, a handled name without data is refused.
         let parsed = serde_json::from_str::<Value>(&ev.data)
@@ -217,6 +225,7 @@ impl Restorer {
             Kind::MessageDelta | Kind::MessageStop if self.held.is_some() => {
                 Err(bad("the message ended while a tool call was still open"))
             }
+            // `Error` only by type here: an event named `error` went on above.
             Kind::MessageDelta | Kind::MessageStop | Kind::Error => {
                 let mut out = self.flush_all()?;
                 out.push(ev);
@@ -926,7 +935,6 @@ mod tests {
             "content_block_stop",
             "message_delta",
             "message_stop",
-            "error",
         ] {
             for data in ["not json", "[1]", "\"s\""] {
                 let res = restorer().push(SseEvent::build(name, data));
@@ -970,7 +978,6 @@ mod tests {
             "content_block_stop",
             "message_delta",
             "message_stop",
-            "error",
         ] {
             let wire = format!("event: {name}\n\n");
             let evs = crate::sse::SseParser::default()
@@ -1040,6 +1047,30 @@ mod tests {
         ] {
             assert_eq!(r.push(e.clone()).unwrap(), vec![e]);
         }
+    }
+    #[test]
+    fn error_events_go_on_raw_whatever_their_shape() {
+        let wire = "event: error\n\n";
+        let bare = crate::sse::SseParser::default().push(wire.as_bytes()).unwrap();
+        for e in [
+            ev("error", json!({"type":"error","error":{"type":"overloaded_error","message":"x"}})),
+            SseEvent::build("error", "not json"),
+            SseEvent::build("error", "[1]"),
+            ev("error", json!({"type":"ping"})),
+            ev("error", json!({"message":"client_x01"})),
+            bare[0].clone(),
+        ] {
+            let mut r = restorer();
+            r.push(text_start(0)).unwrap();
+            r.push(text_delta(0, "a client_x0")).unwrap();
+            // Text carries are flushed first, then the event as it came.
+            let out = r.push(e.clone()).unwrap();
+            assert_eq!(text_of(&out), "client_x0", "{:?}", e.data);
+            assert_eq!(out.last(), Some(&e));
+        }
+        // A data type `error` under another name still fails closed.
+        let res = restorer().push(named(None, r#"{"type":"error","error":{}}"#));
+        assert!(matches!(res, Err(RestoreError::BadEvent(_))));
     }
     #[test]
     fn text_block_starting_with_text_fails_closed() {

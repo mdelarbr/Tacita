@@ -20,6 +20,8 @@ use super::{MetaHandle, Timing, bounded, short_reason};
 /// Tacita's own keep-alive, sent only while a tool call is held.
 pub const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
 
+const UNEXPECTED_ERROR_SHAPE: &str = "upstream error event in an unexpected shape";
+
 const CUT_OFF: &str =
     "the reply from upstream was cut off; any tool call in progress was not passed on";
 
@@ -167,6 +169,12 @@ impl Restoring {
                 Some("error") => {
                     self.complete = true;
                     upstream_error = true;
+                    if !error_shaped(&ev) {
+                        self.m
+                            .meta
+                            .tacita_error
+                            .get_or_insert_with(|| UNEXPECTED_ERROR_SHAPE.to_string());
+                    }
                 }
                 _ => {}
             }
@@ -230,6 +238,12 @@ impl Restoring {
         self.done = true;
         out
     }
+}
+
+/// An upstream `error` event's data is a JSON object of type `error`.
+fn error_shaped(ev: &SseEvent) -> bool {
+    serde_json::from_str::<Value>(&ev.data)
+        .is_ok_and(|v| v.get("type").and_then(Value::as_str) == Some("error"))
 }
 
 /// The message of a Tacita error event, without the `Tacita: ` prefix.
@@ -423,6 +437,32 @@ mod tests {
         assert_eq!(meta["tacita_error"], message);
         assert_eq!(meta["restored"], 0);
         assert_eq!(meta["dangling"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_event_of_any_shape_goes_on_raw_and_ends_the_stream() {
+        let start = sse(&[(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        )]);
+        let after = sse(&[("message_stop", json!({"type":"message_stop"}))]);
+        for (error, shaped) in [
+            ("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n", true),
+            ("event: error\ndata: upstream is busy\n\n", false),
+            ("event: error\ndata: {\"type\":\"overloaded_error\"}\n\n", false),
+            ("event: error\n\n", false),
+        ] {
+            let chunks = vec![start.clone(), error.as_bytes().to_vec(), after.clone()];
+            let (out, meta) = run(chunks, Restorer::new(pairs(), Limits::default(), None)).await;
+            let want = format!("{}{error}", String::from_utf8(start.clone()).unwrap());
+            assert_eq!(out, want);
+            let expected = if shaped {
+                Value::Null
+            } else {
+                json!("upstream error event in an unexpected shape")
+            };
+            assert_eq!(meta["tacita_error"], expected, "{error}");
+        }
     }
 
     #[tokio::test]
