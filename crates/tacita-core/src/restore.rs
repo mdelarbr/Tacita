@@ -318,8 +318,8 @@ impl Restorer {
         let Some(restored) = self.restore_lits(data, input)? else {
             return Ok(ev);
         };
-        let restored =
-            String::from_utf8(restored).map_err(|_| bad("restored tool call start is not UTF-8"))?;
+        let restored = String::from_utf8(restored)
+            .map_err(|_| bad("restored tool call start is not UTF-8"))?;
         Ok(SseEvent::build("content_block_start", &restored))
     }
 
@@ -463,7 +463,9 @@ fn ended_early(input: &[u8], e: &ScanError) -> bool {
         || starts(b"true")
         || starts(b"false")
         || starts(b"null")
-        || (tail.starts_with(b"\\u") && tail.len() < 6 && tail[2..].iter().all(u8::is_ascii_hexdigit))
+        || (tail.starts_with(b"\\u")
+            && tail.len() < 6
+            && tail[2..].iter().all(u8::is_ascii_hexdigit))
 }
 
 /// A `message_start` carrying content would skip the restore: only an
@@ -875,11 +877,20 @@ mod tests {
     #[test]
     fn tool_input_cut_short_is_restored_up_to_the_cut() {
         // A max_tokens cut: the input simply ends, wherever that falls.
-        for tail in ["\"cli", "tru", "nul", "fals", "-", "1.", "1e", "\"\\u00", "\"\\", "[", "{\"k\""] {
+        for tail in [
+            "\"cli", "tru", "nul", "fals", "-", "1.", "1e", "\"\\u00", "\"\\", "[", "{\"k\"",
+        ] {
             let input = format!("{{\"a\":\"client_x01\",\"b\":{tail}");
-            let out = run(&mut restorer(), vec![tool_start(0), tool_delta(0, &input), stop(0)]);
+            let out = run(
+                &mut restorer(),
+                vec![tool_start(0), tool_delta(0, &input), stop(0)],
+            );
             let want = input.replacen("client_x01", "acmewidgets", 1);
-            assert_eq!(data(&out[1])["delta"]["partial_json"], want.as_str(), "{tail}");
+            assert_eq!(
+                data(&out[1])["delta"]["partial_json"],
+                want.as_str(),
+                "{tail}"
+            );
         }
     }
     #[test]
@@ -891,7 +902,10 @@ mod tests {
             "{\"a\":\"client_x01\",\"b\":trux,\"c\":\"client_x01\"}".to_string(),
             "{\"a\":\"client_x01\"} \"client_x01\"".to_string(),
         ] {
-            let res = try_run(&mut restorer(), vec![tool_start(0), tool_delta(0, &input), stop(0)]);
+            let res = try_run(
+                &mut restorer(),
+                vec![tool_start(0), tool_delta(0, &input), stop(0)],
+            );
             assert!(
                 matches!(&res, Err(RestoreError::BadEvent(m)) if m == "a tool call's input could not be read"),
                 "{input:.40}: {res:?}"
@@ -1051,9 +1065,14 @@ mod tests {
     #[test]
     fn error_events_go_on_raw_whatever_their_shape() {
         let wire = "event: error\n\n";
-        let bare = crate::sse::SseParser::default().push(wire.as_bytes()).unwrap();
+        let bare = crate::sse::SseParser::default()
+            .push(wire.as_bytes())
+            .unwrap();
         for e in [
-            ev("error", json!({"type":"error","error":{"type":"overloaded_error","message":"x"}})),
+            ev(
+                "error",
+                json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
+            ),
             SseEvent::build("error", "not json"),
             SseEvent::build("error", "[1]"),
             ev("error", json!({"type":"ping"})),
@@ -1119,7 +1138,10 @@ mod tests {
             ],
         );
         assert_eq!(out[0], tool_start_with(json!({"k":"acmewidgets"})));
-        assert_eq!(data(&out[1])["delta"]["partial_json"], "{\"q\":\"acmewidgets\"}");
+        assert_eq!(
+            data(&out[1])["delta"]["partial_json"],
+            "{\"q\":\"acmewidgets\"}"
+        );
         assert_eq!(r.restored(), 2);
     }
     #[test]

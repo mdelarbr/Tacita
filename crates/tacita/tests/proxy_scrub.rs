@@ -851,7 +851,10 @@ async fn lone_surrogates_do_not_break_the_session() {
     // Scrubbed, and every other byte as it came, escapes included.
     assert_eq!(sent, LONE.replace("acmewidgets", "client_x01"));
     let m = &meta_lines(&t, 1).await[0];
-    assert_eq!((m["status"].clone(), m["scrubbed"].clone()), (json!(200), json!(2)));
+    assert_eq!(
+        (m["status"].clone(), m["scrubbed"].clone()),
+        (json!(200), json!(2))
+    );
     assert_eq!(m["reals_left"], 0);
     assert_eq!(m["model_in"], "claude-opus-5-5");
 }

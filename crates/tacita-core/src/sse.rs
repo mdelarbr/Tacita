@@ -177,13 +177,18 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].event.as_deref(), Some("ping"));
         assert_eq!(evs[0].data, "{\"type\": \"ping\"}");
-        assert_eq!(evs[0].raw, b"event: ping\ndata: {\"type\": \"ping\"}\n\n".to_vec());
+        assert_eq!(
+            evs[0].raw,
+            b"event: ping\ndata: {\"type\": \"ping\"}\n\n".to_vec()
+        );
     }
 
     #[test]
     fn handles_crlf_cr_and_multiline_data() {
         let mut p = SseParser::default();
-        let evs = p.push(b"event: x\r\ndata: a\r\ndata: b\r\n\r\ndata: c\r\rdata: d").unwrap();
+        let evs = p
+            .push(b"event: x\r\ndata: a\r\ndata: b\r\n\r\ndata: c\r\rdata: d")
+            .unwrap();
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].data, "a\nb");
         assert_eq!(evs[1].data, "c");
@@ -201,7 +206,11 @@ mod tests {
     #[test]
     fn rejects_invalid_utf8() {
         assert!(SseParser::default().push(b"data: \xff\n\n").is_err());
-        assert!(SseParser::default().push(b"event: \xff\ndata: a\n\n").is_err());
+        assert!(
+            SseParser::default()
+                .push(b"event: \xff\ndata: a\n\n")
+                .is_err()
+        );
     }
 
     #[test]
@@ -238,12 +247,18 @@ data: later
 
     #[test]
     fn oversized_unfinished_event_is_an_error_and_poisons() {
-        let mut p = SseParser { max_override: Some(64), ..Default::default() };
+        let mut p = SseParser {
+            max_override: Some(64),
+            ..Default::default()
+        };
         assert!(p.push(&[b'a'; 60]).unwrap().is_empty());
         assert_eq!(p.push(&[b'a'; 10]).unwrap_err(), SseError::EventTooLarge);
         assert_eq!(p.push(b"\n\n").unwrap_err(), SseError::EventTooLarge);
         // Finished events are not counted against the cap.
-        let mut p = SseParser { max_override: Some(64), ..Default::default() };
+        let mut p = SseParser {
+            max_override: Some(64),
+            ..Default::default()
+        };
         let big = format!("data: {}\n\n", "a".repeat(50));
         assert_eq!(p.push(big.repeat(5).as_bytes()).unwrap().len(), 5);
     }
@@ -257,7 +272,10 @@ data: later
 
     #[test]
     fn build_writes_one_data_line_per_line() {
-        assert_eq!(SseEvent::build("x", "d").raw, b"event: x\ndata: d\n\n".to_vec());
+        assert_eq!(
+            SseEvent::build("x", "d").raw,
+            b"event: x\ndata: d\n\n".to_vec()
+        );
         let ev = SseEvent::build("x", "a\nb");
         assert_eq!(ev.raw, b"event: x\ndata: a\ndata: b\n\n".to_vec());
         let evs = SseParser::default().push(&ev.raw).unwrap();

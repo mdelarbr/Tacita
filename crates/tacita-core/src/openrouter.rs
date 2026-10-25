@@ -158,12 +158,17 @@ mod tests {
     fn lone_surrogates_are_read_as_replacement_characters() {
         let body = r#"{"model":"claude-x","messages":[{"role":"user","content":"a \uD800 client_x01 \udfff"}]}"#;
         let v = run(body, &[]).unwrap();
-        assert_eq!(v["messages"][0]["content"], "a \u{FFFD} client_x01 \u{FFFD}");
+        assert_eq!(
+            v["messages"][0]["content"],
+            "a \u{FFFD} client_x01 \u{FFFD}"
+        );
     }
 
     #[test]
     fn unknown_model_fails_closed() {
-        assert!(matches!(adapt_request(br#"{"model":"gpt-5","messages":[]}"#, "x/y", &Prefs { only: vec![] }), Err(AdaptError::UnknownModel(m)) if m == "gpt-5"));
+        assert!(
+            matches!(adapt_request(br#"{"model":"gpt-5","messages":[]}"#, "x/y", &Prefs { only: vec![] }), Err(AdaptError::UnknownModel(m)) if m == "gpt-5")
+        );
     }
 
     #[test]
@@ -207,24 +212,43 @@ mod tests {
     fn routing_fields_are_refused() {
         for k in ["models", "route", "plugins", "transforms", "preset"] {
             let e = run(&format!(r#"{{"model":"claude-x","{k}":[]}}"#), &[]).unwrap_err();
-            assert!(matches!(&e, AdaptError::RoutingFieldPresent(n) if n == k), "{k}");
+            assert!(
+                matches!(&e, AdaptError::RoutingFieldPresent(n) if n == k),
+                "{k}"
+            );
         }
     }
 
     #[test]
     fn identity_fields_user_and_session_id_are_removed() {
-        let v = run(r#"{"model":"claude-x","user":"u","session_id":"s","max_tokens":1}"#, &[]).unwrap();
+        let v = run(
+            r#"{"model":"claude-x","user":"u","session_id":"s","max_tokens":1}"#,
+            &[],
+        )
+        .unwrap();
         assert!(v.get("user").is_none() && v.get("session_id").is_none());
         assert_eq!(v["max_tokens"], 1);
     }
 
     #[test]
     fn duplicate_keys_regressions() {
-        let v = run(r#"{"model":"claude-x","metadata":{"user_id":"a","k":1,"user_id":"b"}}"#, &[]).unwrap();
+        let v = run(
+            r#"{"model":"claude-x","metadata":{"user_id":"a","k":1,"user_id":"b"}}"#,
+            &[],
+        )
+        .unwrap();
         assert_eq!(v["metadata"], json!({"k":1}));
-        let out = adapt_request(br#"{"model":"claude-x","metadata":{"user_id":"a","user_id":"b"}}"#, "a/b", &Prefs::default()).unwrap();
+        let out = adapt_request(
+            br#"{"model":"claude-x","metadata":{"user_id":"a","user_id":"b"}}"#,
+            "a/b",
+            &Prefs::default(),
+        )
+        .unwrap();
         assert!(!String::from_utf8(out).unwrap().contains("user_id"));
-        assert!(matches!(run(r#"{"model":"claude-x","provider":{},"provider":{}}"#, &[]), Err(AdaptError::ProviderFieldPresent)));
+        assert!(matches!(
+            run(r#"{"model":"claude-x","provider":{},"provider":{}}"#, &[]),
+            Err(AdaptError::ProviderFieldPresent)
+        ));
     }
 
     #[test]
@@ -234,8 +258,14 @@ mod tests {
             {"role":"user","content":"q"},
             {"role":"assistant","content":[{"type":"text","text":"2"},{"type":"redacted_thinking","data":"d"}]}]}"#;
         let v = run(body, &[]).unwrap();
-        assert_eq!(v["messages"][0]["content"], json!([{"type":"text","text":"1"}]));
-        assert_eq!(v["messages"][2]["content"], json!([{"type":"text","text":"2"}]));
+        assert_eq!(
+            v["messages"][0]["content"],
+            json!([{"type":"text","text":"1"}])
+        );
+        assert_eq!(
+            v["messages"][2]["content"],
+            json!([{"type":"text","text":"2"}])
+        );
     }
 
     #[test]

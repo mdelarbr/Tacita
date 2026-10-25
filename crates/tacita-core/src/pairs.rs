@@ -53,7 +53,10 @@ impl Pairs {
         if pairs.is_empty() {
             return Err(PairsError::Empty);
         }
-        if pairs.iter().any(|p| p.real.is_empty() || p.standin.is_empty()) {
+        if pairs
+            .iter()
+            .any(|p| p.real.is_empty() || p.standin.is_empty())
+        {
             return Err(PairsError::EmptyValue);
         }
         if let Some(p) = pairs.iter().find(|p| !valid_standin(&p.standin)) {
@@ -111,14 +114,25 @@ impl Pairs {
             .flat_map(|p| (1..p.standin.len()).map(|k| p.standin[..k].to_string()))
             .collect();
         let max_standin_len = pairs.iter().map(|p| p.standin.len()).max().unwrap_or(0);
-        Ok(Pairs { pairs, real_ac, standin_ac, prefixes, max_standin_len })
+        Ok(Pairs {
+            pairs,
+            real_ac,
+            standin_ac,
+            prefixes,
+            max_standin_len,
+        })
     }
 
     /// Non-overlapping, sorted matches of real values; each with its stand-in.
     pub fn find_reals(&self, text: &str) -> Vec<(Range<usize>, &str)> {
         self.real_ac
             .find_iter(text)
-            .map(|m| (m.range(), self.pairs[m.pattern().as_usize()].standin.as_str()))
+            .map(|m| {
+                (
+                    m.range(),
+                    self.pairs[m.pattern().as_usize()].standin.as_str(),
+                )
+            })
             .collect()
     }
 
@@ -134,7 +148,9 @@ impl Pairs {
     /// stand-in, or `text.len()`. Only the last `max_standin_len - 1` bytes
     /// are examined, so the cost per call is bounded.
     pub fn hold_from(&self, text: &str) -> usize {
-        let lo = text.len().saturating_sub(self.max_standin_len.saturating_sub(1));
+        let lo = text
+            .len()
+            .saturating_sub(self.max_standin_len.saturating_sub(1));
         (lo..text.len())
             .filter(|&i| text.is_char_boundary(i))
             .find(|&i| self.prefixes.contains(&text[i..]))
@@ -169,9 +185,18 @@ impl Pairs {
 #[cfg(test)]
 pub(crate) fn test_pairs() -> Pairs {
     Pairs::new(vec![
-        Pair { real: "acmewidgets".into(), standin: "client_x01".into() },
-        Pair { real: "AcmeWidgets".into(), standin: "ClientX01".into() },
-        Pair { real: "Jeanne Fictive".into(), standin: "person_x01".into() },
+        Pair {
+            real: "acmewidgets".into(),
+            standin: "client_x01".into(),
+        },
+        Pair {
+            real: "AcmeWidgets".into(),
+            standin: "ClientX01".into(),
+        },
+        Pair {
+            real: "Jeanne Fictive".into(),
+            standin: "person_x01".into(),
+        },
     ])
     .unwrap()
 }
@@ -181,15 +206,22 @@ mod tests {
     use super::*;
 
     fn pr(r: &str, s: &str) -> Pair {
-        Pair { real: r.into(), standin: s.into() }
+        Pair {
+            real: r.into(),
+            standin: s.into(),
+        }
     }
 
     #[test]
     fn scrub_and_restore_round_trip() {
-        let (s, n) = test_pairs().scrub_str("cd ~/code/acmewidgets && open AcmeWidgets.app # Jeanne Fictive");
+        let (s, n) = test_pairs()
+            .scrub_str("cd ~/code/acmewidgets && open AcmeWidgets.app # Jeanne Fictive");
         assert_eq!(s, "cd ~/code/client_x01 && open ClientX01.app # person_x01");
         assert_eq!(n, 3);
-        assert_eq!(test_pairs().restore_str(&s).0, "cd ~/code/acmewidgets && open AcmeWidgets.app # Jeanne Fictive");
+        assert_eq!(
+            test_pairs().restore_str(&s).0,
+            "cd ~/code/acmewidgets && open AcmeWidgets.app # Jeanne Fictive"
+        );
     }
 
     #[test]
@@ -201,20 +233,47 @@ mod tests {
         assert_eq!(p.hold_from("plain"), 5);
         assert_eq!(p.hold_from(""), 0);
         // multibyte text before the window must not panic
-        assert_eq!(p.hold_from("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}c"), 22);
+        assert_eq!(
+            p.hold_from("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}c"),
+            22
+        );
     }
 
     #[test]
     fn rejects_ambiguous_sets() {
         assert!(matches!(Pairs::new(vec![]), Err(PairsError::Empty)));
-        assert!(matches!(Pairs::new(vec![pr("", "x_x01")]), Err(PairsError::EmptyValue)));
-        assert!(matches!(Pairs::new(vec![pr("a1", "x_x01"), pr("a1", "y_x01")]), Err(PairsError::DuplicateReal(_))));
-        assert!(matches!(Pairs::new(vec![pr("a1", "x_x01"), pr("a2", "x_x01")]), Err(PairsError::DuplicateStandin(_))));
-        assert!(matches!(Pairs::new(vec![pr("a1", "ab_x01"), pr("a2", "b_x01")]), Err(PairsError::Nested(..))));
-        assert!(matches!(Pairs::new(vec![pr("a1", "ab_x01"), pr("a2", "x01_ab")]), Err(PairsError::Overlap(..))));
-        assert!(matches!(Pairs::new(vec![pr("client", "client_x01")]), Err(PairsError::Crossed(..))));
-        assert!(matches!(Pairs::new(vec![pr("a1", "client x01")]), Err(PairsError::BadStandin(_))));
-        assert!(matches!(Pairs::new(vec![pr("a\u{FFFD}b", "q_x01")]), Err(PairsError::ReplacementChar(_))));
+        assert!(matches!(
+            Pairs::new(vec![pr("", "x_x01")]),
+            Err(PairsError::EmptyValue)
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("a1", "x_x01"), pr("a1", "y_x01")]),
+            Err(PairsError::DuplicateReal(_))
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("a1", "x_x01"), pr("a2", "x_x01")]),
+            Err(PairsError::DuplicateStandin(_))
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("a1", "ab_x01"), pr("a2", "b_x01")]),
+            Err(PairsError::Nested(..))
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("a1", "ab_x01"), pr("a2", "x01_ab")]),
+            Err(PairsError::Overlap(..))
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("client", "client_x01")]),
+            Err(PairsError::Crossed(..))
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("a1", "client x01")]),
+            Err(PairsError::BadStandin(_))
+        ));
+        assert!(matches!(
+            Pairs::new(vec![pr("a\u{FFFD}b", "q_x01")]),
+            Err(PairsError::ReplacementChar(_))
+        ));
     }
 
     #[test]
@@ -222,7 +281,10 @@ mod tests {
         let p = test_pairs();
         let t = "acmewidgetsAcmeWidgets";
         let m = p.find_reals(t);
-        assert_eq!(m.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(), vec![0..11, 11..22]);
+        assert_eq!(
+            m.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+            vec![0..11, 11..22]
+        );
         let q = Pairs::new(vec![pr("Acme", "co_x01"), pr("Acme Corp", "co_x02")]).unwrap();
         let t = "Acme Corp and Acme, Acme Corpse";
         let m = q.find_reals(t);

@@ -64,7 +64,9 @@ fn should_scrub(root: &Value, lit: &Lit) -> bool {
             (Value::Array(a), Seg::Index(j)) => a.get(*j),
             _ => None,
         };
-        let Some(child) = child else { return !lit.is_key };
+        let Some(child) = child else {
+            return !lit.is_key;
+        };
         let last = i + 1 == n;
         let is_own_key = last && lit.is_key;
         let key = match seg {
@@ -93,13 +95,17 @@ fn should_scrub(root: &Value, lit: &Lit) -> bool {
         match key {
             Some("cache_control") => return false,
             // Only base64 payloads (images, PDFs) are opaque; text sources are scrubbed.
-            Some("data") if i >= 1 && is_key(&path[i - 1], "source") && type_of(cur) == Some("base64") => {
+            Some("data")
+                if i >= 1 && is_key(&path[i - 1], "source") && type_of(cur) == Some("base64") =>
+            {
                 return false;
             }
             Some("model" | "metadata") if i == 0 => return false,
             Some("system") if i == 0 && child.is_string() => return false,
             Some("name") if i == 1 && is_key(&path[0], "tool_choice") => return false,
-            Some("name") if i == 2 && matches!(path[1], Seg::Index(_)) && is_key(&path[0], "tools") => {
+            Some("name")
+                if i == 2 && matches!(path[1], Seg::Index(_)) && is_key(&path[0], "tools") =>
+            {
                 return false;
             }
             Some("name") if last && tool_use_parent => return false,
@@ -129,7 +135,8 @@ pub fn scrub_request(body: &[u8], pairs: &Pairs) -> Result<Scrubbed, RequestErro
     // The policy walk reads a copy with lone surrogates cleaned; the scan,
     // the edits and the output use `body` itself, so they stay byte-exact.
     let cleaned = json::clean_lone_surrogates(body);
-    let root: Value = serde_json::from_slice(&cleaned).map_err(|e| RequestError::Invalid(e.to_string()))?;
+    let root: Value =
+        serde_json::from_slice(&cleaned).map_err(|e| RequestError::Invalid(e.to_string()))?;
     if !root.is_object() {
         return Err(RequestError::NotAnObject);
     }
@@ -152,7 +159,11 @@ pub fn scrub_request(body: &[u8], pairs: &Pairs) -> Result<Scrubbed, RequestErro
         edits.push((lit.span.clone(), json::replace(raw, &decoded, &found)));
     }
     edits.sort_by_key(|(r, _)| r.start);
-    Ok(Scrubbed { body: json::splice(body, edits), replacements, in_system })
+    Ok(Scrubbed {
+        body: json::splice(body, edits),
+        replacements,
+        in_system,
+    })
 }
 
 #[cfg(test)]
@@ -164,27 +175,62 @@ mod tests {
     fn out() -> (serde_json::Value, String, usize) {
         let s = scrub_request(FIXTURE, &test_pairs()).unwrap();
         assert_eq!(s.in_system, 2);
-        (serde_json::from_slice(&s.body).unwrap(), String::from_utf8(s.body).unwrap(), s.replacements)
+        (
+            serde_json::from_slice(&s.body).unwrap(),
+            String::from_utf8(s.body).unwrap(),
+            s.replacements,
+        )
     }
     #[test]
     fn scrubs_user_content() {
         let (v, _, n) = out();
         assert_eq!(n, 12);
-        assert_eq!(v.pointer("/system/2/text").unwrap(), "Working directory: /Users/dev/code/client_x01\nGit branch: client_x01-main");
-        assert_eq!(v.pointer("/messages/0/content/0/text").unwrap(), "Summarize client_x01/README.md");
-        assert!(v.pointer("/tools/0/input_schema/properties/client_x01_id").is_some());
-        assert_eq!(v.pointer("/tools/0/input_schema/required/0").unwrap(), "client_x01_id");
-        assert_eq!(v.pointer("/messages/1/content/1/input/client_x01_id").unwrap(), "client_x01-42");
-        assert_eq!(v.pointer("/messages/1/content/1/input/type").unwrap(), "client_x01");
-        assert_eq!(v.pointer("/messages/2/content/0/content/0/text").unwrap(), "Row: client_x01, owner person_x01");
+        assert_eq!(
+            v.pointer("/system/2/text").unwrap(),
+            "Working directory: /Users/dev/code/client_x01\nGit branch: client_x01-main"
+        );
+        assert_eq!(
+            v.pointer("/messages/0/content/0/text").unwrap(),
+            "Summarize client_x01/README.md"
+        );
+        assert!(
+            v.pointer("/tools/0/input_schema/properties/client_x01_id")
+                .is_some()
+        );
+        assert_eq!(
+            v.pointer("/tools/0/input_schema/required/0").unwrap(),
+            "client_x01_id"
+        );
+        assert_eq!(
+            v.pointer("/messages/1/content/1/input/client_x01_id")
+                .unwrap(),
+            "client_x01-42"
+        );
+        assert_eq!(
+            v.pointer("/messages/1/content/1/input/type").unwrap(),
+            "client_x01"
+        );
+        assert_eq!(
+            v.pointer("/messages/2/content/0/content/0/text").unwrap(),
+            "Row: client_x01, owner person_x01"
+        );
     }
     #[test]
     fn never_touches_protected_parts() {
         let (v, text, _) = out();
         let orig: serde_json::Value = serde_json::from_slice(FIXTURE).unwrap();
-        for p in ["/system/0", "/system/1", "/model", "/metadata", "/tools/0/name", "/messages/1/content/0",
-                  "/messages/1/content/1/id", "/messages/1/content/1/name", "/messages/2/content/0/tool_use_id",
-                  "/messages/0/content/1/source/data"] {
+        for p in [
+            "/system/0",
+            "/system/1",
+            "/model",
+            "/metadata",
+            "/tools/0/name",
+            "/messages/1/content/0",
+            "/messages/1/content/1/id",
+            "/messages/1/content/1/name",
+            "/messages/2/content/0/tool_use_id",
+            "/messages/0/content/1/source/data",
+        ] {
             assert_eq!(v.pointer(p), orig.pointer(p), "{p}");
         }
         assert_eq!(text.matches("acmewidgets").count(), 7);
@@ -201,10 +247,16 @@ mod tests {
     }
     #[test]
     fn non_object_and_serde_rejects() {
-        assert!(matches!(scrub_request(b"[1]", &test_pairs()), Err(RequestError::NotAnObject)));
+        assert!(matches!(
+            scrub_request(b"[1]", &test_pairs()),
+            Err(RequestError::NotAnObject)
+        ));
         let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
         let body = format!("{{\"a\":{deep}}}");
-        assert!(matches!(scrub_request(body.as_bytes(), &test_pairs()), Err(RequestError::Invalid(_))));
+        assert!(matches!(
+            scrub_request(body.as_bytes(), &test_pairs()),
+            Err(RequestError::Invalid(_))
+        ));
     }
     /// Lone surrogates in an untouched literal, in an edited one, and in a
     /// protected one, plus the cleaned key path the policy walk must follow.
@@ -273,13 +325,26 @@ mod tests {
         let orig: serde_json::Value = serde_json::from_str(PROBE).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&s.body).unwrap();
         let protected = [
-            "/model", "/metadata", "/system/0", "/system/1", "/tool_choice", "/tools/0/name",
-            "/tools/0/cache_control", "/output_format/type", "/messages/0/content/0/cache_control",
-            "/messages/0/content/1", "/messages/0/content/2", "/messages/0/content/4",
-            "/messages/1/content/0", "/messages/1/content/1",
-            "/messages/1/content/2/id", "/messages/1/content/2/name",
-            "/messages/1/content/3/id", "/messages/1/content/3/name",
-            "/messages/1/content/4/tool_use_id", "/messages/1/content/4/content/0/encrypted_content",
+            "/model",
+            "/metadata",
+            "/system/0",
+            "/system/1",
+            "/tool_choice",
+            "/tools/0/name",
+            "/tools/0/cache_control",
+            "/output_format/type",
+            "/messages/0/content/0/cache_control",
+            "/messages/0/content/1",
+            "/messages/0/content/2",
+            "/messages/0/content/4",
+            "/messages/1/content/0",
+            "/messages/1/content/1",
+            "/messages/1/content/2/id",
+            "/messages/1/content/2/name",
+            "/messages/1/content/3/id",
+            "/messages/1/content/3/name",
+            "/messages/1/content/4/tool_use_id",
+            "/messages/1/content/4/content/0/encrypted_content",
             "/messages/1/content/5/citations/0/encrypted_index",
             "/messages/2/content/0/tool_use_id",
         ];
@@ -287,15 +352,25 @@ mod tests {
             assert_eq!(v.pointer(p), orig.pointer(p), "{p}");
         }
         let scrubbed = [
-            "/system/2/text", "/tools/0/description", "/messages/0/content/3/source/data",
-            "/messages/1/content/3/input/query", "/messages/1/content/4/content/0/url",
-            "/messages/1/content/4/content/0/title", "/messages/1/content/5/citations/0/cited_text",
-            "/messages/1/content/6/unknown_field", "/messages/2/content/0/content",
-            "/tools/0/input_schema/client_x01", "/tools/0/input_examples/0/client_x01",
-            "/output_format/schema/client_x01", "/messages/1/content/2/input/client_x01",
+            "/system/2/text",
+            "/tools/0/description",
+            "/messages/0/content/3/source/data",
+            "/messages/1/content/3/input/query",
+            "/messages/1/content/4/content/0/url",
+            "/messages/1/content/4/content/0/title",
+            "/messages/1/content/5/citations/0/cited_text",
+            "/messages/1/content/6/unknown_field",
+            "/messages/2/content/0/content",
+            "/tools/0/input_schema/client_x01",
+            "/tools/0/input_examples/0/client_x01",
+            "/output_format/schema/client_x01",
+            "/messages/1/content/2/input/client_x01",
         ];
         for p in scrubbed {
-            assert!(!v.pointer(p).unwrap().to_string().contains("acmewidgets"), "{p}");
+            assert!(
+                !v.pointer(p).unwrap().to_string().contains("acmewidgets"),
+                "{p}"
+            );
         }
         // 9 single hits, plus a key and a value in each of the four user-data subtrees.
         assert_eq!(s.replacements, 9 + 8);
@@ -319,7 +394,13 @@ mod tests {
             assert!(!e.to_string().contains("secretco"));
         }
         // Same key in different objects is fine.
-        assert!(scrub_request(br#"{"a":{"k":1},"b":{"k":2},"c":[{"k":1},{"k":1}]}"#, &test_pairs()).is_ok());
+        assert!(
+            scrub_request(
+                br#"{"a":{"k":1},"b":{"k":2},"c":[{"k":1},{"k":1}]}"#,
+                &test_pairs()
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn root_type_does_not_trigger_block_rules() {

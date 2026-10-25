@@ -253,7 +253,10 @@ async fn lone_surrogates_do_not_break_an_openrouter_session() {
     let resp = post(&r.t, body).await;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("acmewidgets") && !text.contains("client_x01"), "{text}");
+    assert!(
+        text.contains("acmewidgets") && !text.contains("client_x01"),
+        "{text}"
+    );
     let (_, sent, _) = last_request(&r.or);
     let v: Value = serde_json::from_slice(&sent).unwrap();
     assert_eq!(
@@ -366,7 +369,10 @@ async fn redirects_from_openrouter_are_refused() {
     )
     .await;
     redirect_refused(post(&t, simple("hi acmewidgets")).await).await;
-    assert_eq!((or.count(), elsewhere.count(), anthropic.count()), (1, 0, 0));
+    assert_eq!(
+        (or.count(), elsewhere.count(), anthropic.count()),
+        (1, 0, 0)
+    );
     let m = &meta_lines(&t, 1).await[0];
     assert_eq!(m["status"], 502);
     assert_eq!(m["tacita_error"], REDIRECT_REFUSED);

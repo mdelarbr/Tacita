@@ -447,9 +447,15 @@ mod tests {
         )]);
         let after = sse(&[("message_stop", json!({"type":"message_stop"}))]);
         for (error, shaped) in [
-            ("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n", true),
+            (
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+                true,
+            ),
             ("event: error\ndata: upstream is busy\n\n", false),
-            ("event: error\ndata: {\"type\":\"overloaded_error\"}\n\n", false),
+            (
+                "event: error\ndata: {\"type\":\"overloaded_error\"}\n\n",
+                false,
+            ),
             ("event: error\n\n", false),
         ] {
             let chunks = vec![start.clone(), error.as_bytes().to_vec(), after.clone()];

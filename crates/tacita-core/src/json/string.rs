@@ -153,7 +153,9 @@ pub fn clean_lone_surrogates(json: &[u8]) -> Cow<'_, [u8]> {
             i += 1;
             continue;
         }
-        let unit = (json.get(i + 1) == Some(&b'u')).then(|| hex_at(i + 2)).flatten();
+        let unit = (json.get(i + 1) == Some(&b'u'))
+            .then(|| hex_at(i + 2))
+            .flatten();
         let Some(unit) = unit.filter(|u| (0xD800..0xE000).contains(u)) else {
             // Any other escape, `\\` included: nothing after its first two
             // bytes can start an escape.
@@ -201,20 +203,29 @@ mod tests {
         let lit = br#""x \u00e9 acmewidgets \/ y""#;
         let d = decode(lit).unwrap();
         let at = d.text.find("acmewidgets").unwrap();
-        assert_eq!(replace(lit, &d, &[(at..at + 11, "client_x01")]), br#""x \u00e9 client_x01 \/ y""#.to_vec());
+        assert_eq!(
+            replace(lit, &d, &[(at..at + 11, "client_x01")]),
+            br#""x \u00e9 client_x01 \/ y""#.to_vec()
+        );
     }
     #[test]
     fn replace_escapes_real_values() {
         let lit = br#""see client_x01""#;
         let d = decode(lit).unwrap();
-        assert_eq!(replace(lit, &d, &[(4..14, "L'\"Oréal\\\n")]), "\"see L'\\\"Oréal\\\\\\n\"".as_bytes());
+        assert_eq!(
+            replace(lit, &d, &[(4..14, "L'\"Oréal\\\n")]),
+            "\"see L'\\\"Oréal\\\\\\n\"".as_bytes()
+        );
     }
     #[test]
     fn match_spanning_an_escape_is_replaced_whole() {
         let lit = br#""Acme\u0057idgets""#;
         let d = decode(lit).unwrap();
         assert_eq!(d.text, "AcmeWidgets");
-        assert_eq!(replace(lit, &d, &[(0..11, "ClientX01")]), br#""ClientX01""#.to_vec());
+        assert_eq!(
+            replace(lit, &d, &[(0..11, "ClientX01")]),
+            br#""ClientX01""#.to_vec()
+        );
     }
     #[test]
     fn lone_surrogate_survives_byte_exact() {
@@ -222,7 +233,10 @@ mod tests {
         let d = decode(lit).unwrap();
         assert!(d.text.starts_with('\u{FFFD}'));
         let at = d.text.find("acmewidgets").unwrap();
-        assert_eq!(replace(lit, &d, &[(at..at + 11, "client_x01")]), br#""\uD800 client_x01""#.to_vec());
+        assert_eq!(
+            replace(lit, &d, &[(at..at + 11, "client_x01")]),
+            br#""\uD800 client_x01""#.to_vec()
+        );
     }
     #[test]
     fn lone_surrogate_escapes_are_cleaned_in_place() {
@@ -239,7 +253,10 @@ mod tests {
             (br#""\uDC00\uD800""#, br#""\uFFFD\uFFFD""#),
             // An escaped backslash is not an escape of `u`.
             (br#"{"\\uD800":"\\\uD800"}"#, br#"{"\\uD800":"\\\uFFFD"}"#),
-            (br#"["\uD83D\uDE00", "\ud83d\ude00", "\u00e9"]"#, br#"["\uD83D\uDE00", "\ud83d\ude00", "\u00e9"]"#),
+            (
+                br#"["\uD83D\uDE00", "\ud83d\ude00", "\u00e9"]"#,
+                br#"["\uD83D\uDE00", "\ud83d\ude00", "\u00e9"]"#,
+            ),
         ];
         for (raw, want) in cases {
             let got = clean_lone_surrogates(raw);

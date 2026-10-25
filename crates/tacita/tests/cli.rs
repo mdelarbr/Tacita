@@ -297,7 +297,10 @@ fn status_says_when_the_daemon_runs_an_older_config() {
     let file = home.path().join("config.toml");
     let cfg = std::fs::read_to_string(&file).unwrap();
     std::fs::write(&file, cfg.replace("\"off\"     #", "\"pairs\"   #")).unwrap();
-    assert_eq!(daemon_line(), "daemon:     running (config changed: restart it)");
+    assert_eq!(
+        daemon_line(),
+        "daemon:     running (config changed: restart it)"
+    );
     std::fs::write(&file, &cfg).unwrap();
     assert_eq!(daemon_line(), "daemon:     running");
     assert!(interrupt(&mut d).success());
@@ -352,7 +355,10 @@ fn send_signal(d: &mut Daemon, name: &str) -> std::process::ExitStatus {
         if let Some(s) = d.0.try_wait().unwrap() {
             return s;
         }
-        assert!(Instant::now() < deadline, "daemon did not stop on SIG{name}");
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not stop on SIG{name}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
