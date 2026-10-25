@@ -48,9 +48,11 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 /// Rewrites a scrubbed Messages body for OpenRouter: model slug, no thinking blocks, no `user_id`, privacy preferences.
+/// Lone surrogates are read as U+FFFD, as the scrub's policy walk reads them.
 pub fn adapt_request(body: &[u8], slug: &str, prefs: &Prefs) -> Result<Vec<u8>, AdaptError> {
+    let body = crate::json::clean_lone_surrogates(body);
     let mut root: Value =
-        serde_json::from_slice(body).map_err(|e| AdaptError::Json(e.to_string()))?;
+        serde_json::from_slice(&body).map_err(|e| AdaptError::Json(e.to_string()))?;
     let obj = root
         .as_object_mut()
         .ok_or_else(|| AdaptError::Json("not a JSON object".into()))?;
@@ -150,6 +152,13 @@ mod tests {
             v["provider"],
             json!({"data_collection":"deny","zdr":true,"allow_fallbacks":false,"only":["groq"]})
         );
+    }
+
+    #[test]
+    fn lone_surrogates_are_read_as_replacement_characters() {
+        let body = r#"{"model":"claude-x","messages":[{"role":"user","content":"a \uD800 client_x01 \udfff"}]}"#;
+        let v = run(body, &[]).unwrap();
+        assert_eq!(v["messages"][0]["content"], "a \u{FFFD} client_x01 \u{FFFD}");
     }
 
     #[test]

@@ -832,6 +832,25 @@ async fn redirects_are_refused_in_pairs_mode() {
     assert_eq!(m["tacita_error"], REDIRECT_REFUSED);
 }
 
+/// A session whose history holds a lone surrogate (a tool result read
+/// from a binary file, say): every later turn carries it.
+const LONE: &str = r#"{"model":"claude-opus-5-5","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"row \uD800 acmewidgets \udfff"},{"type":"text","text":"and acmewidgets?"}]}]}"#;
+
+#[tokio::test]
+async fn lone_surrogates_do_not_break_the_session() {
+    let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;
+    let t = start_pairs(&up, Timing::default()).await;
+    let resp = post(&t, LONE).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await;
+    let sent = String::from_utf8(up.received.lock().unwrap()[0].body.clone()).unwrap();
+    // Scrubbed, and every other byte as it came, escapes included.
+    assert_eq!(sent, LONE.replace("acmewidgets", "client_x01"));
+    let m = &meta_lines(&t, 1).await[0];
+    assert_eq!((m["status"].clone(), m["scrubbed"].clone()), (json!(200), json!(2)));
+    assert_eq!(m["model_in"], "claude-opus-5-5");
+}
+
 #[tokio::test]
 async fn unreadable_request_is_refused_without_quoting_it() {
     let up = FakeUpstream::start(vec![Reply::sse(stop_only())]).await;

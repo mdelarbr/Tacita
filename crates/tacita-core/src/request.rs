@@ -25,7 +25,7 @@ pub enum RequestError {
     /// inside user data can be business names.
     #[error("request body has an object with a repeated key")]
     DuplicateKey,
-    /// Scannable but rejected by serde_json (lone surrogate, nesting too deep).
+    /// Scannable but rejected by serde_json (nesting too deep).
     /// The message is serde's own text and never contains body content.
     #[error("request body is not valid JSON: {0}")]
     Invalid(String),
@@ -126,7 +126,10 @@ pub fn scrub_request(body: &[u8], pairs: &Pairs) -> Result<Scrubbed, RequestErro
             return Err(RequestError::DuplicateKey);
         }
     }
-    let root: Value = serde_json::from_slice(body).map_err(|e| RequestError::Invalid(e.to_string()))?;
+    // The policy walk reads a copy with lone surrogates cleaned; the scan,
+    // the edits and the output use `body` itself, so they stay byte-exact.
+    let cleaned = json::clean_lone_surrogates(body);
+    let root: Value = serde_json::from_slice(&cleaned).map_err(|e| RequestError::Invalid(e.to_string()))?;
     if !root.is_object() {
         return Err(RequestError::NotAnObject);
     }
@@ -199,11 +202,23 @@ mod tests {
     #[test]
     fn non_object_and_serde_rejects() {
         assert!(matches!(scrub_request(b"[1]", &test_pairs()), Err(RequestError::NotAnObject)));
-        let e = scrub_request(br#"{"a":"\uD800 acmewidgets"}"#, &test_pairs()).unwrap_err();
-        assert!(matches!(e, RequestError::Invalid(ref m) if !m.contains("acmewidgets")));
         let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
         let body = format!("{{\"a\":{deep}}}");
         assert!(matches!(scrub_request(body.as_bytes(), &test_pairs()), Err(RequestError::Invalid(_))));
+    }
+    /// Lone surrogates in an untouched literal, in an edited one, and in a
+    /// protected one, plus the cleaned key path the policy walk must follow.
+    const LONE: &str = r#"{"model":"claude-x","system":[{"type":"text","text":"a"},{"type":"text","text":"b acmewidgets \uD800"},{"type":"text","text":"cwd /x/acmewidgets \udbff"}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"row \uD800 acmewidgets"},{"type":"text","text":"keep \uDC00 as is"},{"type":"tool_use","id":"t2","name":"\uD800acmewidgets","input":{"\uDFFF acmewidgets":"acmewidgets \uD800\uD800\uDC00"}}]}]}"#;
+    #[test]
+    fn lone_surrogates_are_kept_byte_exact_and_names_still_scrubbed() {
+        let s = scrub_request(LONE.as_bytes(), &test_pairs()).unwrap();
+        let want = LONE
+            .replace("cwd /x/acmewidgets", "cwd /x/client_x01")
+            .replace(r"row \uD800 acmewidgets", r"row \uD800 client_x01")
+            .replace(r"\uDFFF acmewidgets", r"\uDFFF client_x01")
+            .replace(r#""acmewidgets \uD800"#, r#""client_x01 \uD800"#);
+        assert_eq!(String::from_utf8(s.body).unwrap(), want);
+        assert_eq!((s.replacements, s.in_system), (4, 1));
     }
     #[test]
     fn odd_shapes_scrub_without_panic() {

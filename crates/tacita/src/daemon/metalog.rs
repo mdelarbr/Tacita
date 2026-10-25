@@ -123,13 +123,15 @@ impl RequestMeta {
     }
 
     /// `model` and the head of `system[1].text`, when the body has them.
+    /// Lone surrogates are read as U+FFFD, as the scrub reads them.
     pub fn peek_request(&mut self, body: &[u8]) {
         #[derive(Deserialize)]
         struct Peek {
             model: Option<Value>,
             system: Option<Value>,
         }
-        let Ok(p) = serde_json::from_slice::<Peek>(body) else {
+        let body = tacita_core::json::clean_lone_surrogates(body);
+        let Ok(p) = serde_json::from_slice::<Peek>(&body) else {
             return;
         };
         self.model_in = p

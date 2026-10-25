@@ -240,6 +240,23 @@ async fn names_restored_from_openrouter_stream() {
     assert!(!text.contains("client_x01") && !text.contains("person_x01"));
 }
 
+#[tokio::test]
+async fn lone_surrogates_do_not_break_an_openrouter_session() {
+    let body = r#"{"model":"claude-opus-5-5","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"and acmewidgets?"},{"type":"tool_result","tool_use_id":"t1","content":"row \uD800 acmewidgets"}]}]}"#;
+    let r = rig(Some(STATE), Some(KEY), vec![Reply::Echo]).await;
+    let resp = post(&r.t, body).await;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("acmewidgets") && !text.contains("client_x01"), "{text}");
+    let (_, sent, _) = last_request(&r.or);
+    let v: Value = serde_json::from_slice(&sent).unwrap();
+    assert_eq!(
+        v["messages"][0]["content"][1]["content"],
+        "row \u{FFFD} client_x01"
+    );
+    assert!(!String::from_utf8(sent).unwrap().contains("acmewidgets"));
+}
+
 const COMMENT: &str = ": OPENROUTER PROCESSING\n\n";
 
 #[tokio::test]

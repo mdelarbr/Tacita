@@ -1,5 +1,6 @@
 //! Codec for one JSON string literal, with an offset map back to the raw bytes.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use thiserror::Error;
 
@@ -137,6 +138,41 @@ pub fn encode(s: &str) -> String {
     out
 }
 
+/// A copy of `json` in which every lone-surrogate escape (`\uD800` to
+/// `\uDFFF`, not part of a high+low pair) is the six bytes `\uFFFD`, for
+/// serde_json, which rejects lone surrogates. Both are six bytes, so every
+/// offset still points at the same place in `json`. Borrowed when there is
+/// none. A backslash outside a string is not valid JSON, so every one met
+/// here starts an escape.
+pub fn clean_lone_surrogates(json: &[u8]) -> Cow<'_, [u8]> {
+    let hex_at = |i: usize| json.get(i..).and_then(hex4);
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < json.len() {
+        if json[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let unit = (json.get(i + 1) == Some(&b'u')).then(|| hex_at(i + 2)).flatten();
+        let Some(unit) = unit.filter(|u| (0xD800..0xE000).contains(u)) else {
+            // Any other escape, `\\` included: nothing after its first two
+            // bytes can start an escape.
+            i += 2;
+            continue;
+        };
+        let paired = (0xD800..0xDC00).contains(&unit)
+            && json.get(i + 6..i + 8) == Some(&b"\\u"[..])
+            && hex_at(i + 8).is_some_and(|lo| (0xDC00..0xE000).contains(&lo));
+        if paired {
+            i += 12;
+            continue;
+        }
+        out.get_or_insert_with(|| json.to_vec())[i..i + 6].copy_from_slice(b"\\uFFFD");
+        i += 6;
+    }
+    out.map_or(Cow::Borrowed(json), Cow::Owned)
+}
+
 /// Replaces byte ranges of the decoded text, copying every other raw byte unchanged.
 pub fn replace(lit: &[u8], decoded: &Decoded, edits: &[(Range<usize>, &str)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lit.len());
@@ -187,6 +223,38 @@ mod tests {
         assert!(d.text.starts_with('\u{FFFD}'));
         let at = d.text.find("acmewidgets").unwrap();
         assert_eq!(replace(lit, &d, &[(at..at + 11, "client_x01")]), br#""\uD800 client_x01""#.to_vec());
+    }
+    #[test]
+    fn lone_surrogate_escapes_are_cleaned_in_place() {
+        let cases: [(&[u8], &[u8]); 9] = [
+            (br#""\uD800 x""#, br#""\uFFFD x""#),
+            (br#""\udfff""#, br#""\uFFFD""#),
+            (br#""a\uDC00b\uDBFF""#, br#""a\uFFFDb\uFFFD""#),
+            // A high escape followed by something other than a low escape.
+            (br#""\uD800\u0041""#, br#""\uFFFD\u0041""#),
+            (br#""\uD800\n""#, br#""\uFFFD\n""#),
+            // Two highs, then a low: the first is alone.
+            (br#""\uD800\uD800\uDC00""#, br#""\uFFFD\uD800\uDC00""#),
+            // A low before a high is not a pair.
+            (br#""\uDC00\uD800""#, br#""\uFFFD\uFFFD""#),
+            // An escaped backslash is not an escape of `u`.
+            (br#"{"\\uD800":"\\\uD800"}"#, br#"{"\\uD800":"\\\uFFFD"}"#),
+            (br#"["\uD83D\uDE00", "\ud83d\ude00", "\u00e9"]"#, br#"["\uD83D\uDE00", "\ud83d\ude00", "\u00e9"]"#),
+        ];
+        for (raw, want) in cases {
+            let got = clean_lone_surrogates(raw);
+            assert_eq!(
+                (got.as_ref(), got.len()),
+                (want, raw.len()),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        let clean = br#"{"a":"\uD83D\uDE00 \u00e9"}"#;
+        assert!(matches!(clean_lone_surrogates(clean), Cow::Borrowed(_)));
+        // The cleaned copy is what serde_json reads.
+        let v: String = serde_json::from_slice(&clean_lone_surrogates(br#""\uD800x""#)).unwrap();
+        assert_eq!(v, "\u{FFFD}x");
     }
     #[test]
     fn rejects_raw_control_and_bad_escape() {
