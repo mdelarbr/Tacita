@@ -131,6 +131,12 @@ async fn openrouter_body_adapted_and_scrubbed() {
     );
     // Left: two tool names, the tool_use id, the tool_use_id, the image data.
     assert_eq!(text.matches("acmewidgets").count(), 5, "{text}");
+    // The log counts what still leaves, in the bytes OpenRouter received.
+    let m = &meta_lines(&r.t, 1).await[0];
+    assert_eq!(m["reals_left"], reals_in(text.as_bytes()));
+    assert!(reals_in(text.as_bytes()) >= 5);
+    let log = std::fs::read_to_string(r.t.log_path()).unwrap();
+    assert!(!log.contains("acmewidgets"), "a count, never a value");
 }
 
 #[tokio::test]

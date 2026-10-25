@@ -282,6 +282,27 @@ pub async fn tacita_error(resp: reqwest::Response, status: u16) -> String {
     msg
 }
 
+/// The default `step0.pairs`.
+pub fn default_pairs() -> tacita_core::pairs::Pairs {
+    let p = |real: &str, standin: &str| tacita_core::pairs::Pair {
+        real: real.into(),
+        standin: standin.into(),
+    };
+    tacita_core::pairs::Pairs::new(vec![
+        p("acmewidgets", "client_x01"),
+        p("AcmeWidgets", "ClientX01"),
+        p("Jeanne Fictive", "person_x01"),
+    ])
+    .unwrap()
+}
+
+/// Real values of the default pairs found in `body`.
+pub fn reals_in(body: &[u8]) -> usize {
+    default_pairs()
+        .find_reals(std::str::from_utf8(body).unwrap())
+        .len()
+}
+
 pub const REDIRECT_REFUSED: &str = "upstream answered with a redirect; refusing to pass it on";
 
 /// An upstream that answers every request with a `code` redirect to

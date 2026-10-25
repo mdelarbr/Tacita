@@ -465,6 +465,8 @@ async fn metalog_records_safe_fields_only() {
     assert_eq!(m["route"], "messages");
     assert_eq!(m["provider"], "anthropic");
     assert_eq!(m["protection"], "off");
+    // Off mode counts nothing: null, never a reassuring 0.
+    assert_eq!(m.get("reals_left"), Some(&Value::Null));
     assert_eq!(m["session"], "sess-1");
     assert_eq!(m["model_in"], "claude-opus-5-5");
     assert_eq!(m["model_out"], "claude-opus-5-5");

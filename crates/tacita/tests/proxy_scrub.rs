@@ -222,6 +222,10 @@ async fn scrubbed_request_reaches_upstream() {
     assert_eq!(m["scrubbed"], expected.replacements);
     assert_eq!(m["scrubbed_system"], expected.in_system);
     assert_eq!(expected.in_system, 2);
+    // What still leaves, counted in the forwarded bytes: the fixture keeps
+    // real names in fields that are never rewritten.
+    assert_eq!(m["reals_left"], reals_in(&body));
+    assert!(reals_in(&body) >= 7, "{}", reals_in(&body));
 }
 
 #[tokio::test]
@@ -848,6 +852,7 @@ async fn lone_surrogates_do_not_break_the_session() {
     assert_eq!(sent, LONE.replace("acmewidgets", "client_x01"));
     let m = &meta_lines(&t, 1).await[0];
     assert_eq!((m["status"].clone(), m["scrubbed"].clone()), (json!(200), json!(2)));
+    assert_eq!(m["reals_left"], 0);
     assert_eq!(m["model_in"], "claude-opus-5-5");
 }
 

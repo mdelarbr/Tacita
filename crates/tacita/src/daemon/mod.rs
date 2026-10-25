@@ -350,6 +350,9 @@ async fn messages(
         url.push('?');
         url.push_str(q);
     }
+    if protected {
+        m.meta.reals_left = Some(reals_left(&app.pairs, &body));
+    }
     m.cap_forwarded(&body);
     let sent = app
         .client
@@ -386,6 +389,12 @@ fn scrub(app: &App, m: &mut MetaHandle, body: &[u8]) -> Result<Vec<u8>, Box<Resp
             Err(Box::new(error_response(StatusCode::BAD_REQUEST, reply)))
         }
     }
+}
+
+/// Occurrences of real values in `body`, the bytes going upstream: what
+/// the scrub left, in fields it never rewrites or forms it cannot see.
+fn reals_left(pairs: &Pairs, body: &[u8]) -> usize {
+    pairs.find_reals(&String::from_utf8_lossy(body)).len()
 }
 
 /// The OpenRouter route: model, key, scrub, adapt, then the same protected
@@ -446,6 +455,7 @@ async fn openrouter(
         Err(e) => return m.fail(StatusCode::BAD_REQUEST, bounded(&e.to_string())),
     };
     m.meta.model_out = Some(slug.to_string());
+    m.meta.reals_left = Some(reals_left(&app.pairs, &body));
     m.cap_forwarded(&body);
     let url = format!(
         "{}/v1/messages",

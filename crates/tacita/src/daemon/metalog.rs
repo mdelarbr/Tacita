@@ -57,6 +57,11 @@ pub struct RequestMeta {
     pub system1_head: Option<String>,
     pub scrubbed: Option<usize>,
     pub scrubbed_system: Option<usize>,
+    /// Occurrences of real values from the pairs still in the bytes sent
+    /// upstream: a count, never the values. Set for every protected
+    /// Anthropic request and every OpenRouter request that was sent;
+    /// `None` otherwise, so off mode never shows a reassuring 0.
+    pub reals_left: Option<usize>,
     pub restored: Option<usize>,
     pub dangling: Option<usize>,
     /// The status sent to the client; 0 if none was sent.
