@@ -6,15 +6,15 @@ Rules for the whole run:
 
 - Every Claude Code session in Step 0 starts as `ANTHROPIC_BASE_URL=$(tacita status --base-url) claude`, inside the throwaway repo. This is the only setting Tacita uses. Never set `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `apiKeyHelper` or `CLAUDE_CODE_OAUTH_TOKEN`: each one switches the Max login off.
 - Do not edit `~/.claude/settings.json`. The guard hook (test 4) is installed only by the throwaway repo's own `.claude/settings.json`.
-- After every edit of `~/Library/Application Support/Tacita/config.toml`, stop `tacita daemon` with Ctrl-C and start it again.
+- After every edit of `~/Library/Application Support/Tacita/config.toml`, stop `tacita daemon` with Ctrl-C and start it again. A daemon still running an older `config.toml` refuses every request with ``Tacita: config.toml changed since the daemon started; restart `tacita daemon` ``, and `tacita status` shows `daemon:     running (config changed: restart it)`.
 - `tacita` commands that fail with a usage error (for example `tacita use openrouter` without `--model`) exit with code 2.
 - Commands below are run from the repo root (`/Users/praexo/code/Tacita`) unless they say otherwise.
 
-Reading the log. `requests.jsonl` has one JSON line per request. This helper prints the useful fields (run it from any directory):
+Reading the log. `requests.jsonl` has one JSON line per request. This helper prints the useful fields (run it from any directory). `reals_left` counts the real values from `step0.pairs` still in the bytes sent upstream (a count, never the values); it is null in `off` mode and on requests that were not forwarded.
 
 ```bash
 LOG=~/Library/Application\ Support/Tacita/logs/requests.jsonl
-jq -c '{n,route,status,provider,protection,model_out,scrubbed,scrubbed_system,restored,usage,tacita_error,upstream_error,rl:.ratelimit}' "$LOG" | tail -20
+jq -c '{n,route,status,provider,protection,model_out,scrubbed,scrubbed_system,reals_left,restored,usage,tacita_error,upstream_error,rl:.ratelimit}' "$LOG" | tail -20
 ```
 
 ## 0. Preparation
@@ -73,11 +73,14 @@ Pass criteria (tick in `results.md`):
 - The `ratelimit` object is present on those lines and `anthropic-ratelimit-unified-status` is `allowed`.
 - `anthropic-ratelimit-unified-5h-utilization` rises over the session.
 - No overage: no `anthropic-ratelimit-unified-overage-*` value says extra usage was used, and the claude.ai usage page shows plan usage, not extra usage.
-- Probe: exactly one line has `"tacita_error":"block probe"` and status 400 for the probe prompt, and Claude Code did not loop. Count:
+- Probe: exactly one line of the main model has `"tacita_error":"block probe"` and status 400 for the probe prompt, and Claude Code did not loop. Auxiliary requests (a session title, for example, often on a smaller model) may carry the same text and be blocked too; they do not count. The main model is the `model_in` of most `messages` lines:
   ```bash
-  grep -c '"tacita_error":"block probe"' ~/Library/Application\ Support/Tacita/logs/requests.jsonl
+  LOG=~/Library/Application\ Support/Tacita/logs/requests.jsonl
+  jq -r 'select(.route == "messages") | .model_in' "$LOG" | sort | uniq -c
+  MAIN='MAIN_MODEL'   # the main model from the list above
+  jq -c --arg m "$MAIN" 'select(.tacita_error == "block probe" and .model_in == $m) | {n, model_in, status}' "$LOG"
   ```
-  Compare with the count before the probe.
+  Compare with the lines it printed before the probe: exactly one new line.
 - After `/clear`, the next prompt gets a normal status 200.
 
 ## Test 2. Max with scrubbing (`anthropic.protection = "pairs"`)
@@ -91,6 +94,7 @@ Steps: a new session in the throwaway repo (`ANTHROPIC_BASE_URL=$(tacita status 
 3. Then: `append a line "Reviewed by Jeanne Fictive for acmewidgets" to notes.md`.
 4. Long tool-call hold (stall watchdog check): ask the model to Write one long file, for example `write a 2,000-line generated file big.txt`. Watch the log and the client. Record whether Claude Code aborts with a stall or timeout during the hold. If the hold was too short to tell, say so. (Claude Code's watchdog fires after about 300 s; Tacita sends pings every 10 s and holds a tool call for at most 480 s. The question is whether the pings count as activity.)
 5. Probe: ask the model to reply with exactly `TACITA_STREAM_PROBE`. Claude Code must show the error `Tacita: stream probe: this reply was stopped on purpose (Step 0)`.
+6. Run `/clear`. Claude Code keeps the probe prompt in the conversation, so without it every later turn would ask for the probe again.
 
 Pass criteria:
 
@@ -118,17 +122,47 @@ If test 2 fails: record it. The spec fallback is credentials-only on Max (Plan 2
 Claude Code adds your own context to every request: the git identity, the account email, the macOS username in the working directory, and the global `~/.claude/CLAUDE.md`. Plan 1 only scrubs what `step0.pairs` lists, so do this first, before anything goes to OpenRouter.
 
 1. Add your real identifiers to `step0.pairs` in `config.toml`, each exact spelling, because Plan 1 does no case or accent folding. Add: the git `user.name`, the account email, the macOS username, the company domain, and the first name as written in your `~/.claude/CLAUDE.md`. Use stand-ins such as `person_x02`, `email_x01`, `user_x01`, `company_x01`. Example line: `{ real = "<exact spelling>", standin = "email_x01" },`. Keep the three default pairs.
-2. Set `record_dir` to its own folder, separate from the test-5 corpus, absolute and outside any git repo: `record_dir = "/Users/<you>/tacita-precheck"` (the daemon refuses to start inside a git work tree). Set `[anthropic] protection = "pairs"`. Restart the daemon. In the throwaway repo, run ONE prompt on Anthropic, started with the same prefix as the test-3 session so the request shape matches:
+2. Set `record_dir` to its own folder, separate from the test-5 corpus, absolute and outside any git repo: `record_dir = "/Users/<you>/tacita-precheck"` (the daemon refuses to start inside a git work tree). Set `[anthropic] protection = "pairs"`. Restart the daemon, then note where the log ends, so the checks below read only this run:
+   ```bash
+   LOG=~/Library/Application\ Support/Tacita/logs/requests.jsonl
+   START=$(wc -l < "$LOG")
+   ```
+   In the throwaway repo, run a short session on Anthropic, started with the same prefix as the test-3 session so the request shape matches:
    ```bash
    ENABLE_CLAUDEAI_MCP_SERVERS=false ANTHROPIC_BASE_URL=$(tacita status --base-url) claude
    ```
-3. Check the WHOLE newest run, not one file (the newest file can be a small auxiliary request, such as a title request, without CLAUDE.md or git context). Give `grep -lF` every real spelling you put in `step0.pairs`, one `-e` each (`-F`: dots in an email or domain are not wildcards):
+   It needs at least two turns and one subagent turn, so the main, subagent and auxiliary request layouts are all covered: for example `read README.md and summarize it`, then `use a subagent to list the files`. Then quit Claude Code.
+3. Check the WHOLE run, not one file (the newest file can be a small auxiliary request, such as a title request, without CLAUDE.md or git context). Three checks; go on only when all three hold.
+   - The identifiers. Give `grep -lF` every real spelling you put in `step0.pairs`, one `-e` each (`-F`: dots in an email or domain are not wildcards). It searches what went to Anthropic (`-forwarded.json`) and what came back (`-upstream.txt`); hits in `-request.json` (the original request) and `-client.txt` (the restored reply) are expected. This must print nothing:
+     ```bash
+     D=$(ls -dt ~/tacita-precheck/run-* | head -1)
+     grep -lF -e 'SPELLING1' -e 'SPELLING2' -e 'SPELLING3' "$D"/*-forwarded.json "$D"/*-upstream.txt
+     ```
+   - What still leaves. No forwarded line of this run may hold a real value (`reals_left`; null only on a request that was not forwarded). This must print nothing:
+     ```bash
+     tail -n +$((START + 1)) "$LOG" | jq -c 'select(.reals_left != null and .reals_left > 0) | {n, model_in, reals_left}'
+     ```
+   - The system prompt. Every main and subagent request must have `scrubbed_system` greater than 0: its working directory names the throwaway repo, so a 0 means that text reached Anthropic in a place the scrub does not rewrite. Main and subagent requests carry tools; short auxiliary requests (a session title, for example) usually carry none and may show 0. This lists each request of the run with its tool count:
+     ```bash
+     RUN=$(tail -n +$((START + 1)) "$LOG")
+     for f in "$D"/*-request.json; do
+       n=$((10#$(basename "$f" -request.json)))
+       tools=$(jq '.tools // [] | length' "$f")
+       echo "$RUN" | jq -c --argjson n "$n" --argjson tools "$tools" \
+         'select(.n == $n and .route == "messages") | {n, model_in, tools: $tools, scrubbed_system, reals_left}'
+     done
+     ```
+     Every line with `tools` greater than 0 must show `scrubbed_system` greater than 0, and the list must include the subagent's requests. A request's first user message tells them apart (the subagent's is the task the main model wrote for it):
+     ```bash
+     jq -c '.messages[0].content' "$D"/NNNNNN-request.json | head -c 300
+     ```
+
+   If a check fails: find where the spelling sits in the forwarded body (each line is a JSON path), with the request number from the check:
    ```bash
-   D=$(ls -dt ~/tacita-precheck/run-* | head -1)
-   grep -lF -e 'SPELLING1' -e 'SPELLING2' -e 'SPELLING3' "$D"/*-forwarded.json
+   jq -c 'paths(type == "string" and contains("SPELLING1"))' "$D"/NNNNNN-forwarded.json
    ```
-   Go on only when this prints nothing. If it prints file names, add the missing spelling to `step0.pairs`, restart the daemon and repeat with a new prompt (each run is a new `run-<ms>` folder). Each daemon run writes into `<record_dir>/run-<start Unix ms>/`, and request numbers restart at 1 per run. Requests refused before their body is read (for example a 413) are not recorded.
-   Then delete the pre-check folder, because its `-request.json` files hold your unscrubbed identifiers, and remove or comment out `record_dir` in `config.toml` (test 5 sets its own); restart the daemon:
+   A field the scrub rewrites (a message, a tool result, `system[2]` or later) needs the missing spelling in `step0.pairs`. A field Tacita never rewrites, such as the tool name of a local MCP server (`tools`, then `name`), needs no pair: disable that MCP server for test 3 instead. Then restart the daemon, note a new `START`, and repeat with a new session (each run is a new `run-<ms>` folder). Each daemon run writes into `<record_dir>/run-<start Unix ms>/`, and request numbers restart at 1 per run. Requests refused before their body is read (for example a 413) are not recorded.
+   Then delete the pre-check folder, because its `-request.json` and `-client.txt` files hold your real identifiers, and remove or comment out `record_dir` in `config.toml` (test 5 sets its own); restart the daemon:
    ```bash
    rm -rf ~/tacita-precheck
    ```
@@ -147,6 +181,14 @@ Steps:
 5. Finish with `tacita use anthropic`.
 
 Record each slug tried, with pass or fail per capability (Read, Edit, Bash, multi-turn, thinking, `--continue`).
+
+After each session, check that no real value reached OpenRouter. This must print nothing:
+
+```bash
+jq -c 'select(.provider == "openrouter" and .reals_left != null and .reals_left > 0) | {n, model_out, reals_left}' ~/Library/Application\ Support/Tacita/logs/requests.jsonl
+```
+
+If it prints a line, record it and stop using OpenRouter until the field is found (repeat the pre-check with that kind of request).
 
 If every OpenRouter reply ends with `Tacita: unexpected event from upstream`, record it and the slug. It likely means OpenRouter does not give its SSE events names matching their data `type`; the restorer fails closed on that by design.
 
@@ -192,10 +234,10 @@ Afterwards, search the corpus for secrets (the recorder keeps real request bodie
 grep -rlE 'sk-ant-|sk-or-|ghp_|AKIA|-----BEGIN|Bearer ' ~/tacita-corpus
 ```
 
-Also search it for your real identifiers from the test-3 pairs (`-F`, one `-e` per spelling). These files are the scrubbed copies, but `-request.json` holds the original, so hits there are expected: they are why the corpus must stay private. Hits in `-forwarded.json` or `-client.txt` are not expected:
+Also search it for your real identifiers from the test-3 pairs (`-F`, one `-e` per spelling). `-request.json` holds the original request and `-client.txt` the restored reply, so hits there are expected: they are why the corpus must stay private. Hits in `-forwarded.json` (what went upstream) or `-upstream.txt` (what came back) are not expected. This must print nothing:
 
 ```bash
-grep -rlF -e 'SPELLING1' -e 'SPELLING2' ~/tacita-corpus
+grep -rlF -e 'SPELLING1' -e 'SPELLING2' --include='*-forwarded.json' --include='*-upstream.txt' ~/tacita-corpus
 ```
 
 Fix or delete every hit before keeping the corpus. The corpus stays outside the repo and is never committed.
@@ -209,4 +251,4 @@ jq -r '[.method,.path,.route,.status]|@tsv' ~/Library/Application\ Support/Tacit
 jq -r '.header_names[]' ~/Library/Application\ Support/Tacita/logs/requests.jsonl | sort | uniq -c
 ```
 
-Then `tacita use anthropic`, set `[anthropic] protection = "off"` if you want the default back, and stop the daemon with Ctrl-C (it prints `Tacita stopped`).
+Then `tacita use anthropic`, set `[anthropic] protection = "off"` if you want the default back, and remove or comment out the three probes in `config.toml`: `block_probe`, `stream_probe` and `guard_probe`. They are on by default only for Step 0; left on, any request, reply or tool call that happens to contain one is blocked. Stop the daemon with Ctrl-C (it prints `Tacita stopped`) and start it again if you keep using it.

@@ -28,7 +28,7 @@ Fill in during the run (see `runbook.md`). Write PASS, FAIL or n/a, and a note f
 | `ratelimit` headers present, `unified-status` allowed | | |
 | `5h-utilization` rises | | |
 | No overage; claude.ai shows plan usage, not extra usage | | |
-| `TACITA_BLOCK_PROBE`: error shown, exactly one `block probe` line, no retry loop | | |
+| `TACITA_BLOCK_PROBE`: error shown, exactly one `block probe` line of the main model (`model_in`), no retry loop | | |
 | After `/clear` the next prompt works | | |
 
 ## Test 2. Max with scrubbing (protection pairs)
@@ -53,6 +53,7 @@ First turn (`acmewidgets: read README.md and summarize it`), on its own line:
 | Reply shows `acmewidgets` | | |
 | `grep -rn 'client_x01\|ClientX01\|person_x01' . --exclude-dir=.git` prints nothing | | |
 | `TACITA_STREAM_PROBE`: `Tacita: stream probe` error shown | | |
+| `/clear` run after the stream probe | | |
 | (a) Anthropic honours `accept-encoding: identity` on SSE (no 502 "compressed stream from upstream") | | |
 | (b) Stall watchdog (~300 s) counts pings as activity during a long Write hold (say if the hold was too short to tell) | | |
 | (c) `usage.cache_read > 0` from turn 2 | | |
@@ -70,15 +71,20 @@ Pre-flight:
 | Step | Result | Notes |
 | --- | --- | --- |
 | Own identifiers added to `step0.pairs` | | |
-| One Anthropic prompt recorded (own record_dir); `grep -lF` over the whole newest run printed nothing; pre-check folder deleted | | |
+| Pre-check session recorded (own record_dir): at least two turns and one subagent turn | | |
+| `grep -lF` over the run's `-forwarded.json` and `-upstream.txt` printed nothing | | |
+| `reals_left` is 0 on every forwarded line of the run | | |
+| `scrubbed_system > 0` on every main and subagent request (`tools` > 0), subagent requests listed | | |
+| Hits in fields Tacita never rewrites (e.g. a local MCP server's tool name): server disabled for test 3, not paired | | |
+| Pre-check folder deleted, `record_dir` removed | | |
 | Session started with `ENABLE_CLAUDEAI_MCP_SERVERS=false` | | |
 | Only harmless Bash commands used | | |
 
 One row per slug tried:
 
-| Slug | Read | Edit | Bash | Multi-turn | Thinking display | `--continue` across a switch | Provider / ZDR on activity page | "unexpected event from upstream" on every reply? |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| | | | | | | | | |
+| Slug | Read | Edit | Bash | Multi-turn | Thinking display | `--continue` across a switch | Provider / ZDR on activity page | "unexpected event from upstream" on every reply? | `reals_left` 0 on every OpenRouter line |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| | | | | | | | | | |
 
 Fallback (Claude models via OpenRouter) tried: 
 
@@ -120,7 +126,7 @@ Fallback (Claude models via OpenRouter) tried:
 | `/compact` | | |
 | Thinking turn | | |
 | Secret grep (`sk-ant-`, `sk-or-`, `ghp_`, `AKIA`, `-----BEGIN`, `Bearer `) found nothing, or hits fixed / deleted | | |
-| Identifier grep (`-F`, test-3 pairs): no hits in `-forwarded.json` / `-client.txt`; hits fixed / deleted | | |
+| Identifier grep (`-F`, test-3 pairs): no hits in `-forwarded.json` / `-upstream.txt` (hits in `-request.json` / `-client.txt` expected); hits fixed / deleted | | |
 | Corpus kept outside the repo, not committed | | |
 
 ## Decisions
@@ -129,4 +135,5 @@ Fallback (Claude models via OpenRouter) tried:
 - OpenRouter models that passed: 
 - Guard hook OK (and `continueOnBlock` needed?): 
 - New paths or headers seen in the log: 
+- Probes (`block_probe`, `stream_probe`, `guard_probe`) removed or commented out of `config.toml`: 
 - Other findings: 
